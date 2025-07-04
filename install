@@ -1,0 +1,434 @@
+#!/bin/bash
+# FreeUTM Dependency Installer for Debian
+# Version: 1.1
+# License: GPLv3
+
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}This script must be run as root${NC}" >&2
+    exit 1
+fi
+
+
+echo -e "${YELLOW}Creating system backup...${NC}"
+backup_dir="/root/utm_backup_$(date +%Y%m%d)"
+mkdir -p "$backup_dir"
+tar czvf "$backup_dir/pre_utm_backup.tar.gz" /etc /boot /var/log 2>/dev/null
+echo -e "${GREEN}Backup created at $backup_dir/pre_utm_backup.tar.gz${NC}"
+
+# ======================
+# 1. Kernel Module Setup
+# ======================
+echo -e "${YELLOW}Configuring kernel modules...${NC}"
+
+# Load required modules
+declare -a required_modules=(
+    "xt_comment" "xt_limit" "xt_recent" "xt_TCPMSS" "xt_tcpudp" 
+    "xt_state" "xt_conntrack" "nf_conntrack" "nf_conntrack_ftp" 
+    "nf_conntrack_irc" "nf_nat_ftp" "nf_nat_irc" "xt_multiport" 
+    "xt_addrtype" "xt_mark" "sch_htb" "sch_sfq" "act_mirred" 
+    "act_connmark" "ifb"
+)
+
+for module in "${required_modules[@]}"; do
+    if ! grep -q "^$module" /etc/modules; then
+        echo "$module" >> /etc/modules
+        modprobe "$module"
+    fi
+done
+
+# Blacklist unnecessary modules
+cat > /etc/modprobe.d/utm-blacklist.conf <<EOF
+# Disable Bluetooth
+blacklist bluetooth
+blacklist btusb
+
+# Disable uncommon filesystems
+blacklist cramfs
+blacklist freevxfs
+blacklist jffs2
+blacklist hfs
+blacklist hfsplus
+blacklist squashfs
+blacklist udf
+
+# Disable legacy protocols
+blacklist appletalk
+blacklist decnet
+blacklist rds
+blacklist tipc
+EOF
+
+# ========================
+# 2. Kernel Tuning (sysctl)
+# ========================
+echo -e "${YELLOW}Optimizing kernel parameters...${NC}"
+
+cat >> /etc/sysctl.conf <<EOF
+
+# UTM Kernel Optimizations
+# Security Hardening
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.perf_event_paranoid=3
+kernel.yama.ptrace_scope=2
+dev.tty.ldisc_autoload=0
+vm.unprivileged_userfaultfd=0
+
+# Performance Tuning
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.core.netdev_max_backlog=30000
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.ipv4.tcp_window_scaling=1
+
+# Connection Tracking
+net.netfilter.nf_conntrack_max=524288
+net.netfilter.nf_conntrack_tcp_timeout_established=86400
+net.netfilter.nf_conntrack_udp_timeout=60
+net.netfilter.nf_conntrack_udp_timeout_stream=180
+EOF
+
+sysctl -p
+
+
+# ======================
+# 3. Filesystem Optimizations
+# ======================
+echo -e "${YELLOW}Optimizing filesystems...${NC}"
+
+# Update fstab with performance options
+sed -i '/\/ ext4/s/defaults/defaults,noatime,nodiratime,errors=remount-ro/' /etc/fstab
+sed -i '/\/var ext4/s/defaults/defaults,noatime,nodiratime,data=writeback/' /etc/fstab
+
+# Disable journaling on non-root partitions
+for part in $(lsblk -lnpo NAME,FSTYPE | awk '$2=="ext4"{print $1}'); do
+    if ! mountpoint -q "/" -x "$part"; then
+        tune2fs -O ^has_journal "$part"
+    fi
+done
+
+
+# ======================
+# 4. Service Hardening
+# ======================
+echo -e "${YELLOW}Hardening services...${NC}"
+
+# Remove unnecessary packages
+apt purge -y \
+    avahi-daemon \
+    cups \
+    rpcbind \
+    modemmanager \
+    thermald \
+    snapd \
+    whoopsie \
+    popularity-contest
+
+
+
+# Configure AppArmor
+aa-enforce /etc/apparmor.d/*
+
+# Setup auditd
+cat > /etc/audit/rules.d/utm.rules <<EOF
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k identity
+-w /var/log/ -p wa -k logs
+-w /etc/ssh/sshd_config -p wa -k sshd
+EOF
+service auditd restart
+
+
+
+
+# ======================
+# 5. Network Hardening
+# ======================
+echo -e "${YELLOW}Hardening network stack...${NC}"
+
+# Disable NIC offloading
+for nic in $(ls /sys/class/net/ | grep -v lo); do
+    ethtool -K "$nic" tx off sg off tso off gso off gro off lro off
+    echo "ethtool -K $nic tx off sg off tso off gso off gro off lro off" >> /etc/rc.local
+done
+
+# Configure default firewall drop policy
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+
+
+# ======================
+# 6. UTM Service Profile
+# ======================
+echo -e "${YELLOW}Creating UTM service profile...${NC}"
+
+cat > /etc/systemd/system/utm.target <<EOF
+[Unit]
+Description=UTM Security Suite
+Requires=network.target suricata.service clamav-daemon.service fail2ban.service psad.service auditd.service
+After=network.target
+AllowIsolate=yes
+EOF
+
+
+systemctl enable utm.target
+systemctl set-default utm.target
+
+
+
+# ======================
+# 7. Final Configurations
+# ======================
+echo -e "${YELLOW}Applying final configurations...${NC}"
+
+# Set CPU governor to performance
+apt install -y cpufrequtils
+echo 'GOVERNOR="performance"' > /etc/default/cpufrequtils
+systemctl restart cpufrequtils
+
+# Initialize AIDE
+aideinit --force
+mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+# Setup daily security checks
+cat > /etc/cron.daily/utm-security <<EOF
+#!/bin/bash
+/usr/bin/aide --check
+/usr/bin/lynis audit system
+/usr/bin/rkhunter --check --sk
+EOF
+chmod +x /etc/cron.daily/utm-security
+
+
+# Update package lists
+echo -e "${YELLOW}Updating package lists...${NC}"
+apt-get update -q
+
+# Install base dependencies
+echo -e "${YELLOW}Installing base dependencies...${NC}"
+apt-get install -y -q \
+    build-essential \
+    git \
+    curl \
+    wget \
+    gnupg \
+    software-properties-common \
+    dirmngr \
+    apt-transport-https \
+    ca-certificates
+
+# Function to install individual components
+install_component() {
+    local name="$1"
+    local install_cmd="$2"
+    local test_cmd="$3"
+    
+    echo -e "${YELLOW}Installing $name...${NC}"
+    if eval "$test_cmd" >/dev/null 2>&1; then
+        echo -e "${GREEN}$name is already installed${NC}"
+        return 0
+    fi
+    
+    if eval "$install_cmd"; then
+        echo -e "${GREEN}Successfully installed $name${NC}"
+        return 0
+    else
+        echo -e "${RED}Failed to install $name${NC}" >&2
+        return 1
+    fi
+}
+
+# Install ClamAV
+install_component "ClamAV" \
+    "apt-get install -y -q clamav clamav-daemon clamav-freshclam" \
+    "command -v clamscan"
+
+# Install Maldet
+install_component "Malware Detect (Maldet)" \
+    "wget -q -O /tmp/maldet.tar.gz http://www.rfxn.com/downloads/maldetect-current.tar.gz && \
+     tar -xzf /tmp/maldet.tar.gz -C /tmp && \
+     cd /tmp/maldetect-* && \
+     ./install.sh && \
+     rm -rf /tmp/maldetect-* /tmp/maldet.tar.gz" \
+    "command -v maldet"
+
+# Install Suricata
+install_component "Suricata" \
+    "add-apt-repository -y ppa:oisf/suricata-stable && \
+     apt-get update -q && \
+     apt-get install -y -q suricata" \
+    "command -v suricata"
+
+# Install Fail2Ban
+install_component "Fail2Ban" \
+    "apt-get install -y -q fail2ban" \
+    "command -v fail2ban-client"
+
+# Install RKHunter
+install_component "RKHunter" \
+    "apt-get install -y -q rkhunter" \
+    "command -v rkhunter"
+
+# Install YARA
+install_component "YARA" \
+    "apt-get install -y -q yara" \
+    "command -v yara"
+
+# Install Lynis
+install_component "Lynis" \
+    "apt-get install -y -q lynis" \
+    "command -v lynis"
+
+# Install OpenVPN
+install_component "OpenVPN" \
+    "apt-get install -y -q openvpn easy-rsa" \
+    "command -v openvpn"
+
+# Install PSAD
+install_component "PSAD" \
+    "apt-get install -y -q psad" \
+    "command -v psad"
+
+# Install Squid for web filtering
+install_component "Squid" \
+    "apt-get install -y -q squid" \
+    "command -v squid"
+
+# Install DansGuardian for content filtering
+install_component "DansGuardian" \
+    "apt-get install -y -q dansguardian" \
+    "command -v dansguardian"
+
+# Install Cuckoo Sandbox
+install_component "Cuckoo Sandbox" \
+    "apt-get install -y -q python python-pip python-dev libffi-dev libssl-dev && \
+     pip install -U pip && \
+     pip install -U cuckoo" \
+    "command -v cuckoo"
+
+# Install Keepalived for HA
+install_component "Keepalived" \
+    "apt-get install -y -q keepalived" \
+    "command -v keepalived"
+
+# Install ocserv for SSL VPN
+install_component "ocserv (SSL VPN)" \
+    "apt-get install -y -q ocserv" \
+    "command -v ocserv"
+
+# Install reporting tools
+install_component "wkhtmltopdf" \
+    "apt-get install -y -q xvfb libfontconfig wkhtmltopdf" \
+    "command -v wkhtmltopdf"
+
+# Install traffic control tools
+install_component "Traffic Control (tc)" \
+    "apt-get install -y -q iproute2" \
+    "command -v tc"
+
+# ===== NEW ADDITIONS START HERE =====
+
+# Install Wondershaper for bandwidth shaping
+install_component "Wondershaper" \
+    "apt-get install -y -q wondershaper" \
+    "command -v wondershaper"
+
+# Install Netdata for monitoring
+install_component "Netdata" \
+    "apt-get install -y -q netdata" 
+
+# Install OpenSSH server (if not already installed)
+install_component "OpenSSH Server" \
+    "apt-get install -y -q openssh-server" \
+    "systemctl is-active ssh"
+
+install_component "Lynis" \
+    "apt-get install -y -q lynis"
+
+
+
+# Install iptables-persistent
+install_component "iptables-persistent" \
+    "echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections && \
+     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections && \
+     apt-get install -y -q iptables-persistent" \
+    "dpkg -l iptables-persistent"
+
+# ===== NEW ADDITIONS END HERE =====
+
+# Configure automatic updates
+echo -e "${YELLOW}Configuring automatic updates...${NC}"
+apt-get install -y -q unattended-upgrades
+dpkg-reconfigure -f noninteractive unattended-upgrades
+
+# Create necessary directories
+echo -e "${YELLOW}Creating directory structure...${NC}"
+mkdir -p /etc/freeutm/{threads,threat_feeds,webfilter,atp,ha,reports}
+mkdir -p /var/log/freeutm
+
+# Set proper permissions
+chmod -R 750 /etc/freeutm
+chmod -R 750 /var/log/freeutm
+
+# Enable services
+echo -e "${YELLOW}Enabling services...${NC}"
+systemctl enable clamav-freshclam
+systemctl enable fail2ban
+systemctl enable psad
+systemctl enable netdata
+
+# Configure SSH (secure default configuration)
+echo -e "${YELLOW}Configuring SSH...${NC}"
+sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+echo "AllowUsers root" >> /etc/ssh/sshd_config
+systemctl restart ssh
+
+# Save current iptables rules
+echo -e "${YELLOW}Saving iptables rules...${NC}"
+netfilter-persistent save
+
+# Final cleanup
+echo -e "${YELLOW}Cleaning up...${NC}"
+apt-get autoremove -y -q
+apt-get clean -y
+
+echo -e "${GREEN}Installation completed successfully!${NC}"
+echo -e "You may want to configure the following:"
+echo -e "1. Reboot the system: ${YELLOW}systemctl reboot${NC}"
+echo -e "1. Update ClamAV signatures: freshclam"
+echo -e "2. Configure Fail2Ban: /etc/fail2ban/jail.local"
+echo -e "3. Initialize Suricata rules: suricata-update"
+echo -e "4. Set up OpenVPN: /etc/openvpn/"
+echo -e "5. Configure web filtering: /etc/squid/ and /etc/dansguardian/"
+echo -e "6. Access Netdata dashboard: http://$(hostname -I | awk '{print $1}'):19999"
+echo -e "7. Configure Wondershaper: /etc/systemd/system/wondershaper.service"
+echo -e "8. Review SSH configuration: /etc/ssh/sshd_config"
+echo -e "9. Verify services: ${YELLOW}systemctl status suricata clamav-daemon fail2ban psad${NC}"
+echo -e "10. Check kernel logs: ${YELLOW}dmesg | grep -i error${NC}"
+echo -e "11. Review security baseline: ${YELLOW}lynis audit system${NC}"
+echo -e "\nBackup available at: ${YELLOW}$backup_dir/pre_utm_backup.tar.gz${NC}"
