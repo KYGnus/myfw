@@ -1,0 +1,1731 @@
+#!/bin/bash
+
+# freeutm - Unified Threat Management for Linux Systems
+
+
+VERSION="2.2.0"
+CONFIG_DIR="/etc/freeutm"
+LOG_DIR="/var/log/freeutm"
+THREADS_DIR="$CONFIG_DIR/threads"
+THREAT_FEEDS_DIR="$CONFIG_DIR/threat_feeds"
+LOCK_FILE="/var/lock/freeutm.lock"
+SURICATA_RULES_DIR="/etc/suricata/rules"
+QUOTA_DB="$CONFIG_DIR/quota.db"
+BANDWIDTH_DB="$CONFIG_DIR/bandwidth.db"
+OPENVPN_DIR="/etc/openvpn"
+PSAD_DIR="/etc/psad"
+
+# Ensure script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root" >&2
+    exit 1
+fi
+
+# Create necessary directories
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$THREADS_DIR" "$THREAT_FEEDS_DIR" "$SURICATA_RULES_DIR" "$OPENVPN_DIR" "$PSAD_DIR" "$WEBFILTER_DIR" "$ATP_DIR" "$HA_DIR" "$REPORT_DIR"
+
+# Initialize logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/freeutm.log"
+}
+
+# Acquire lock to prevent multiple instances
+acquire_lock() {
+    exec 200>$LOCK_FILE
+    flock -n 200 || {
+        log "Another instance is already running. Exiting."
+        exit 1
+    }
+    echo $$ >&200
+}
+
+release_lock() {
+    flock -u 200
+    rm -f $LOCK_FILE
+}
+
+# Email notification function
+send_alert() {
+    local subject=$1
+    local message=$2
+    if [ -f "$CONFIG_DIR/email.conf" ]; then
+        source "$CONFIG_DIR/email.conf"
+        echo "$message" | mail -s "$subject" "$ALERT_EMAIL"
+    else
+        log "Email alert not configured. Create $CONFIG_DIR/email.conf with ALERT_EMAIL variable."
+    fi
+}
+
+# =============================================
+# Thread Management Functions
+# =============================================
+
+add_thread() {
+    local url=$1
+    local thread_id=$(echo "$url" | md5sum | cut -d' ' -f1)
+    
+    if [ -z "$url" ]; then
+        log "Error: No URL provided for thread"
+        return 1
+    fi
+
+    # Validate URL format
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        log "Error: Invalid URL format. Must start with http:// or https://"
+        return 1
+    fi
+
+    # Check if thread already exists
+    if [ -f "$THREADS_DIR/$thread_id" ]; then
+        log "Thread already exists: $url"
+        return 1
+    fi
+
+    # Create thread file
+    echo "$url" > "$THREADS_DIR/$thread_id"
+    log "Added new thread: $url (ID: $thread_id)"
+    
+    # Add to monitoring cron job
+    add_thread_monitoring "$thread_id" "$url"
+}
+
+list_threads() {
+    log "Current monitored threads:"
+    if [ -z "$(ls -A $THREADS_DIR)" ]; then
+        log "No threads currently being monitored"
+    else
+        for thread_file in "$THREADS_DIR"/*; do
+            local url=$(cat "$thread_file")
+            local thread_id=$(basename "$thread_file")
+            log "ID: $thread_id - URL: $url"
+        done
+    fi
+}
+
+
+manage_fail2ban() {
+    # Check if Fail2Ban is installed
+    if ! command -v fail2ban-client >/dev/null; then
+        log "Fail2Ban not installed. Installing..."
+        apt-get install -y fail2ban
+        if [ $? -ne 0 ]; then
+            log "Failed to install Fail2Ban"
+            return 1
+        fi
+        # Create local jail configuration
+        cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+    fi
+
+    case $1 in
+        --start|--stop|--restart|--reload|--status)
+            local action=$(echo "$1" | sed 's/^--//')
+            systemctl $action fail2ban
+            log "Fail2Ban service $action"
+            ;;
+            
+        --enable|--disable)
+            local action=$(echo "$1" | sed 's/^--//')
+            systemctl $action fail2ban
+            log "Fail2Ban service $action at boot"
+            ;;
+            
+        --ban-ip)
+            if [ -z "$2" ]; then
+                log "IP address required for ban"
+                return 1
+            fi
+            fail2ban-client set sshd banip "$2"
+            log "Manually banned IP: $2"
+            ;;
+            
+        --unban-ip)
+            if [ -z "$2" ]; then
+                log "IP address required for unban"
+                return 1
+            fi
+            fail2ban-client set sshd unbanip "$2"
+            log "Manually unbanned IP: $2"
+            ;;
+            
+        --add-jail)
+            if [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
+                log "Jail name, service and filter required"
+                return 1
+            fi
+            local jail_name=$2
+            local service=$3
+            local filter=$4
+            
+            # Create jail configuration
+            cat >> /etc/fail2ban/jail.local <<EOF
+
+[$jail_name]
+enabled  = true
+port     = $service
+filter   = $filter
+logpath  = /var/log/$service.log
+maxretry = 3
+bantime  = 3600
+findtime = 600
+EOF
+            
+            systemctl restart fail2ban
+            log "Added new Fail2Ban jail for $service using $filter filter"
+            ;;
+            
+        --list-banned)
+            fail2ban-client status
+            echo ""
+            fail2ban-client status sshd | grep "Banned IP list"
+            ;;
+            
+        --config-test)
+            fail2ban-client --test
+            if [ $? -eq 0 ]; then
+                log "Fail2Ban configuration test successful"
+            else
+                log "Fail2Ban configuration test failed"
+                return 1
+            fi
+            ;;
+            
+        *)
+            log "Invalid Fail2Ban option"
+            return 1
+            ;;
+    esac
+}
+
+
+
+remove_thread() {
+    local thread_id=$1
+    
+    if [ -z "$thread_id" ]; then
+        log "Error: No thread ID provided"
+        return 1
+    fi
+
+    if [ ! -f "$THREADS_DIR/$thread_id" ]; then
+        log "Error: Thread ID not found: $thread_id"
+        return 1
+    fi
+
+    local url=$(cat "$THREADS_DIR/$thread_id")
+    rm -f "$THREADS_DIR/$thread_id"
+    
+    # Remove from monitoring cron job
+    remove_thread_monitoring "$thread_id"
+    
+    log "Removed thread: $url (ID: $thread_id)"
+}
+
+add_thread_monitoring() {
+    local thread_id=$1
+    local url=$2
+    
+    # Create monitoring script
+    local monitor_script="$THREADS_DIR/monitor_$thread_id.sh"
+    
+    cat > "$monitor_script" <<EOF
+#!/bin/bash
+# Monitor script for thread $thread_id
+# Auto-generated by freeutm
+
+URL="$url"
+LOG_FILE="$LOG_DIR/thread_${thread_id}.log"
+ALERT_FILE="$CONFIG_DIR/email.conf"
+
+response=\$(curl -s -o /dev/null -w "%{http_code}" "\$URL")
+
+if [ "\$response" -ne 200 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Thread alert: \$URL returned status \$response" >> "\$LOG_FILE"
+    
+    if [ -f "\$ALERT_FILE" ]; then
+        source "\$ALERT_FILE"
+        echo "Thread alert: \$URL returned status \$response" | mail -s "Thread Alert: \$URL" "\$ALERT_EMAIL"
+    fi
+fi
+EOF
+
+    chmod +x "$monitor_script"
+    
+    # Add to crontab (check every 5 minutes)
+    (crontab -l 2>/dev/null; echo "*/5 * * * * $monitor_script") | crontab -
+    
+    log "Added monitoring for thread $thread_id"
+}
+
+remove_thread_monitoring() {
+    local thread_id=$1
+    
+    # Remove monitor script
+    rm -f "$THREADS_DIR/monitor_$thread_id.sh"
+    
+    # Remove from crontab
+    crontab -l | grep -v "monitor_$thread_id.sh" | crontab -
+    
+    log "Removed monitoring for thread $thread_id"
+}
+
+# =============================================
+# Scanning Functions
+# =============================================
+
+update_antivirus() {
+    log "Updating antivirus databases..."
+    
+    if [ "$1" == "--clamav" ] || [ "$1" == "--full" ]; then
+        if command -v freshclam >/dev/null; then
+            systemctl stop clamav-freshclam
+            freshclam
+            systemctl start clamav-freshclam
+            log "ClamAV databases updated"
+        else
+            log "ClamAV not installed. Install with: apt install clamav"
+        fi
+    fi
+    
+    if [ "$1" == "--maldet" ] || [ "$1" == "--full" ]; then
+        if command -v maldet >/dev/null; then
+            maldet -u
+            log "Maldet databases updated"
+        else
+            log "Maldet not installed. Install from: https://www.rfxn.com/projects/linux-malware-detect/"
+        fi
+    fi
+    
+    if [ "$1" == "--rkhunter" ] || [ "$1" == "--full" ]; then
+        if command -v rkhunter >/dev/null; then
+            rkhunter --update
+            log "RKHunter databases updated"
+        else
+            log "RKHunter not installed. Install with: apt install rkhunter"
+        fi
+    fi
+    
+    if [ "$1" == "--yara" ] || [ "$1" == "--full" ]; then
+        if command -v yara >/dev/null; then
+            # Update YARA rules from repositories
+            if [ -d "/etc/yara-rules" ]; then
+                cd /etc/yara-rules && git pull
+                log "YARA rules updated"
+            else
+                log "YARA rules directory not found. Consider installing rules."
+            fi
+        else
+            log "YARA not installed. Install with: apt install yara"
+        fi
+    fi
+}
+
+run_scan() {
+    case $1 in
+        --clamav)
+            log "Running ClamAV scan..."
+            if command -v clamscan >/dev/null; then
+                clamscan --remove --infected --recursive --verbose / > "$LOG_DIR/clamav_scan.log" 2>&1
+                send_alert "ClamAV Scan Results" "$(tail -n 20 "$LOG_DIR/clamav_scan.log")"
+                log "ClamAV scan completed. Results in $LOG_DIR/clamav_scan.log"
+            else
+                log "ClamAV not installed"
+            fi
+            ;;
+        --maldet)
+            log "Running Maldet scan..."
+            if command -v maldet >/dev/null; then
+                maldet -a / > "$LOG_DIR/maldet_scan.log" 2>&1
+                send_alert "Maldet Scan Results" "$(tail -n 20 "$LOG_DIR/maldet_scan.log")"
+                log "Maldet scan completed. Results in $LOG_DIR/maldet_scan.log"
+            else
+                log "Maldet not installed"
+            fi
+            ;;
+        --rkhunter)
+            log "Running RKHunter scan..."
+            if command -v rkhunter >/dev/null; then
+                rkhunter --check --skip-keypress > "$LOG_DIR/rkhunter_scan.log" 2>&1
+                send_alert "RKHunter Scan Results" "$(grep -i warning "$LOG_DIR/rkhunter_scan.log")"
+                log "RKHunter scan completed. Results in $LOG_DIR/rkhunter_scan.log"
+            else
+                log "RKHunter not installed"
+            fi
+            ;;
+        --yara)
+            log "Running YARA scan..."
+            if command -v yara >/dev/null; then
+                if [ -d "/etc/yara-rules" ]; then
+                    find / -type f -exec yara -r /etc/yara-rules/index.yar {} + > "$LOG_DIR/yara_scan.log" 2>&1
+                    send_alert "YARA Scan Results" "$(grep -i "match" "$LOG_DIR/yara_scan.log")"
+                    log "YARA scan completed. Results in $LOG_DIR/yara_scan.log"
+                else
+                    log "YARA rules directory not found"
+                fi
+            else
+                log "YARA not installed"
+            fi
+            ;;
+        --full)
+            log "Running full system scan..."
+            run_scan --clamav
+            run_scan --maldet
+            run_scan --rkhunter
+            run_scan --yara
+            log "Full system scan completed"
+            ;;
+        *)
+            log "Invalid scan option"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# IDS/IPS Functions
+# =============================================
+
+manage_suricata() {
+    case $1 in
+        --start)
+            if ! command -v suricata >/dev/null; then
+                log "Suricata not installed. Install with: apt install suricata"
+                return 1
+            fi
+            
+            local interface=$(ip -o -4 route show to default | awk '{print $5}')
+            if [ -z "$interface" ]; then
+                log "Could not determine network interface"
+                return 1
+            fi
+            
+            # Check if Suricata is already running
+            if pgrep -x "suricata" >/dev/null; then
+                log "Suricata is already running"
+                return 0
+            fi
+            
+            # Start Suricata
+            suricata -c /etc/suricata/suricata.yaml -i $interface -D
+            if [ $? -eq 0 ]; then
+                log "Suricata started on interface $interface"
+            else
+                log "Failed to start Suricata"
+                return 1
+            fi
+            ;;
+        --active-log)
+            if [ ! -f "/var/log/suricata/fast.log" ]; then
+                log "Suricata log file not found. Is Suricata running?"
+                return 1
+            fi
+            tail -f /var/log/suricata/fast.log
+            ;;
+        --update)
+            if ! command -v suricata-update >/dev/null; then
+                log "suricata-update not found. Install Suricata first."
+                return 1
+            fi
+            
+            suricata-update
+            if [ $? -eq 0 ]; then
+                log "Suricata rules updated"
+                
+                # Reload Suricata if running
+                if pgrep -x "suricata" >/dev/null; then
+                    kill -USR2 $(pidof suricata)
+                    log "Suricata rules reloaded"
+                fi
+            else
+                log "Failed to update Suricata rules"
+                return 1
+            fi
+            ;;
+        --ips-mode)
+            # Enable IPS mode by enabling NFQUEUE
+            if ! grep -q "nfqueue" /etc/suricata/suricata.yaml; then
+                sed -i '/^ *- detect-protocols:/a \    - af-packet\n    - nfqueue' /etc/suricata/suricata.yaml
+                log "NFQUEUE enabled in Suricata configuration"
+                
+                # Restart Suricata if running
+                if pgrep -x "suricata" >/dev/null; then
+                    pkill -9 suricata
+                    manage_suricata --start
+                fi
+                
+                # Configure iptables to send traffic to NFQUEUE
+                iptables -I INPUT -j NFQUEUE --queue-bypass
+                iptables -I OUTPUT -j NFQUEUE --queue-bypass
+                iptables -I FORWARD -j NFQUEUE --queue-bypass
+                log "IPTables configured for IPS mode"
+            else
+                log "Suricata already configured for IPS mode"
+            fi
+            ;;
+        --add-rule)
+            if [ -z "$2" ]; then
+                log "No rule provided to add"
+                return 1
+            fi
+            
+            # Validate rule syntax
+            if ! echo "$2" | grep -qE '^alert\s+'; then
+                log "Invalid Suricata rule format. Must start with 'alert'"
+                return 1
+            fi
+            
+            # Add rule to local rules file
+            echo "$2" >> "$SURICATA_RULES_DIR/local.rules"
+            
+            # Reload rules if Suricata is running
+            if pgrep -x "suricata" >/dev/null; then
+                kill -USR2 $(pidof suricata)
+                log "Added rule to Suricata and reloaded rules: $2"
+            else
+                log "Added rule to Suricata (service not running): $2"
+            fi
+            ;;
+        *)
+            log "Invalid Suricata action"
+            return 1
+            ;;
+    esac
+}
+
+run_vuln_check() {
+    log "Running vulnerability check..."
+    
+    # Check for Lynis
+    if command -v lynis >/dev/null; then
+        lynis audit system > "$LOG_DIR/lynis_scan.log" 2>&1
+        send_alert "Lynis Vulnerability Scan Results" "$(grep -i warning "$LOG_DIR/lynis_scan.log")"
+        log "Lynis scan completed. Results in $LOG_DIR/lynis_scan.log"
+    else
+        log "Lynis not installed. Install with: apt install lynis"
+    fi
+    
+    # Check for OpenVAS/GVM
+    if command -v gvm-cli >/dev/null; then
+        log "OpenVAS/GVM found. Running vulnerability scan..."
+        gvm-cli --gmp-username admin --gmp-password admin socket --xml "<get_tasks/>" > "$LOG_DIR/openvas_scan.log"
+        log "OpenVAS/GVM scan initiated. Check web interface for results."
+    fi
+    
+    # Check for chkrootkit
+    if command -v chkrootkit >/dev/null; then
+        chkrootkit > "$LOG_DIR/chkrootkit.log" 2>&1
+        send_alert "chkrootkit Results" "$(grep -i infected "$LOG_DIR/chkrootkit.log")"
+        log "chkrootkit scan completed. Results in $LOG_DIR/chkrootkit.log"
+    fi
+    
+    log "Vulnerability check completed"
+}
+
+manage_service() {
+    local service=$1
+    local action=$2
+    
+    if [ -z "$service" ] || [ -z "$action" ]; then
+        log "Service name and action required"
+        return 1
+    fi
+    
+    case $action in
+        --start|--stop|--restart|--status)
+            local cmd=$(echo "$action" | sed 's/^--//')
+            systemctl $cmd $service
+            log "Service $service $cmd attempted"
+            ;;
+        *)
+            log "Invalid service action: $action"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Firewall Functions
+# =============================================
+
+manage_firewall() {
+    # Check if UFW is installed
+    if ! command -v ufw >/dev/null; then
+        log "UFW not installed. Install with: apt install ufw"
+        return 1
+    fi
+    
+    case $1 in
+        --add-rule)
+            if [ "$2" == "--port" ]; then
+                local port=$3
+                local protocol=$5
+                
+                if [ -z "$port" ] || [ -z "$protocol" ]; then
+                    log "Missing port or protocol for firewall rule"
+                    return 1
+                fi
+                
+                # Validate port number
+                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                    log "Invalid port number: $port"
+                    return 1
+                fi
+                
+                # Validate protocol
+                if ! [[ "$protocol" =~ ^(tcp|udp)$ ]]; then
+                    log "Invalid protocol: $protocol (must be tcp or udp)"
+                    return 1
+                fi
+                
+                ufw allow $port/$protocol
+                log "Added firewall rule for $protocol port $port"
+                
+            elif [ "$2" == "--service" ]; then
+                local service=$3
+                
+                if [ -z "$service" ]; then
+                    log "Missing service name for firewall rule"
+                    return 1
+                fi
+                
+                # Check if service exists in /etc/services
+                if ! grep -q "^$service" /etc/services; then
+                    log "Service not found in /etc/services: $service"
+                    return 1
+                fi
+                
+                ufw allow $service
+                log "Added firewall rule for service $service"
+            else
+                log "Invalid add-rule option"
+                return 1
+            fi
+            ;;
+        --panic-mode)
+            if [ "$2" == "--on" ]; then
+                ufw enable
+                ufw default deny incoming
+                ufw default deny outgoing
+                log "Firewall panic mode activated - all traffic blocked"
+            elif [ "$2" == "--off" ]; then
+                ufw default allow outgoing
+                ufw default deny incoming
+                log "Firewall panic mode deactivated"
+            else
+                log "Invalid panic-mode option"
+                return 1
+            fi
+            ;;
+        *)
+            log "Invalid firewall action"
+            return 1
+            ;;
+    esac
+}
+
+
+manage_users() {
+    case $1 in
+        --add)
+            local username=$2
+            local quota_mb=$3
+            local expiry_date=$4
+            
+            if [ -z "$username" ] || [ -z "$quota_mb" ] || [ -z "$expiry_date" ]; then
+                log "Error: Missing parameters for user add"
+                return 1
+            fi
+            
+            # Validate date format (YYYY-MM-DD)
+            if ! date -d "$expiry_date" >/dev/null 2>&1; then
+                log "Error: Invalid date format. Use YYYY-MM-DD"
+                return 1
+            fi
+            
+            # Check if user exists
+            if id "$username" >/dev/null 2>&1; then
+                log "Error: User $username already exists"
+                return 1
+            fi
+            
+            # Create user
+            useradd -m -s /bin/bash "$username"
+            if [ $? -ne 0 ]; then
+                log "Error: Failed to create user $username"
+                return 1
+            fi
+            
+            # Set password
+            echo "Set password for $username:"
+            passwd "$username"
+            
+            # Add to quota database
+            echo "$username:$quota_mb:0:$expiry_date" >> "$QUOTA_DB"
+            log "Added user $username with quota ${quota_mb}MB, expires $expiry_date"
+            
+            # Initialize quota tracking
+            initialize_quota "$username"
+            ;;
+            
+        --remove)
+            local username=$2
+            if [ -z "$username" ]; then
+                log "Error: Missing username"
+                return 1
+            fi
+            
+            # Check if user exists
+            if ! id "$username" >/dev/null 2>&1; then
+                log "Error: User $username does not exist"
+                return 1
+            fi
+            
+            # Remove user
+            userdel -r "$username"
+            
+            # Remove from quota database
+            sed -i "/^$username:/d" "$QUOTA_DB"
+            log "Removed user $username and all associated data"
+            ;;
+            
+        --list)
+            log "User Quota Information:"
+            if [ ! -f "$QUOTA_DB" ] || [ ! -s "$QUOTA_DB" ]; then
+                log "No users with quota configured"
+            else
+                printf "%-15s %-10s %-10s %-15s\n" "Username" "Quota(MB)" "Used(MB)" "Expiry"
+                while IFS=: read -r user quota used expiry; do
+                    printf "%-15s %-10s %-10s %-15s\n" "$user" "$quota" "$used" "$expiry"
+                done < "$QUOTA_DB"
+            fi
+            ;;
+            
+        --set-quota)
+            local username=$2
+            local new_quota=$3
+            if [ -z "$username" ] || [ -z "$new_quota" ]; then
+                log "Error: Missing username or quota value"
+                return 1
+            fi
+            
+            if ! grep -q "^$username:" "$QUOTA_DB"; then
+                log "Error: User $username not found in quota database"
+                return 1
+            fi
+            
+            # Update quota
+            awk -F: -v user="$username" -v quota="$new_quota" \
+                'BEGIN{OFS=":"} $1==user {$2=quota} {print}' "$QUOTA_DB" > "$QUOTA_DB.tmp" \
+                && mv "$QUOTA_DB.tmp" "$QUOTA_DB"
+                
+            log "Updated quota for $username to ${new_quota}MB"
+            ;;
+            
+        --reset-usage)
+            local username=$2
+            if [ -z "$username" ]; then
+                log "Error: Missing username"
+                return 1
+            fi
+            
+            if ! grep -q "^$username:" "$QUOTA_DB"; then
+                log "Error: User $username not found in quota database"
+                return 1
+            fi
+            
+            # Reset usage counter
+            awk -F: -v user="$username" \
+                'BEGIN{OFS=":"} $1==user {$3=0} {print}' "$QUOTA_DB" > "$QUOTA_DB.tmp" \
+                && mv "$QUOTA_DB.tmp" "$QUOTA_DB"
+                
+            log "Reset usage counter for $username"
+            ;;
+            
+        --extend)
+            local username=$2
+            local new_date=$3
+            if [ -z "$username" ] || [ -z "$new_date" ]; then
+                log "Error: Missing username or new expiry date"
+                return 1
+            fi
+            
+            if ! date -d "$new_date" >/dev/null 2>&1; then
+                log "Error: Invalid date format. Use YYYY-MM-DD"
+                return 1
+            fi
+            
+            if ! grep -q "^$username:" "$QUOTA_DB"; then
+                log "Error: User $username not found in quota database"
+                return 1
+            fi
+            
+            # Update expiry date
+            awk -F: -v user="$username" -v date="$new_date" \
+                'BEGIN{OFS=":"} $1==user {$4=date} {print}' "$QUOTA_DB" > "$QUOTA_DB.tmp" \
+                && mv "$QUOTA_DB.tmp" "$QUOTA_DB"
+                
+            log "Extended quota expiry for $username to $new_date"
+            ;;
+            
+        *)
+            log "Invalid user management option"
+            return 1
+            ;;
+    esac
+}
+
+initialize_quota() {
+    local username=$1
+    
+    # Install required packages if not installed
+    if ! command -v iptables >/dev/null; then
+        apt-get install -y iptables
+    fi
+    
+    # Create accounting chains if they don't exist
+    if ! iptables -L QUOTA_IN >/dev/null 2>&1; then
+        iptables -N QUOTA_IN
+        iptables -A FORWARD -j QUOTA_IN
+    fi
+    
+    if ! iptables -L QUOTA_OUT >/dev/null 2>&1; then
+        iptables -N QUOTA_OUT
+        iptables -A FORWARD -j QUOTA_OUT
+    fi
+    
+    # Add rules for this user (if not already present)
+    local user_ip=$(getent hosts "$username" | awk '{print $1}')
+    if [ -z "$user_ip" ]; then
+        log "Error: Could not determine IP address for $username"
+        return 1
+    fi
+    
+    if ! iptables -nL QUOTA_IN | grep -q "$user_ip"; then
+        iptables -A QUOTA_IN -d "$user_ip" -j RETURN
+    fi
+    
+    if ! iptables -nL QUOTA_OUT | grep -q "$user_ip"; then
+        iptables -A QUOTA_OUT -s "$user_ip" -j RETURN
+    fi
+    
+    log "Initialized network quota tracking for $username ($user_ip)"
+}
+
+check_quotas() {
+    log "Checking user quotas..."
+    
+    if [ ! -f "$QUOTA_DB" ] || [ ! -s "$QUOTA_DB" ]; then
+        log "No users with quota configured"
+        return 0
+    fi
+    
+    while IFS=: read -r username quota_mb used_mb expiry_date; do
+        # Check if quota expired
+        current_date=$(date +%Y-%m-%d)
+        if [[ "$current_date" > "$expiry_date" ]]; then
+            log "Quota expired for $username (expired: $expiry_date)"
+            disable_user_access "$username"
+            continue
+        fi
+        
+        # Get current usage from iptables
+        user_ip=$(getent hosts "$username" | awk '{print $1}')
+        if [ -z "$user_ip" ]; then
+            log "Error: Could not get IP for $username"
+            continue
+        fi
+        
+        bytes_in=$(iptables -nvxL QUOTA_IN | awk -v ip="$user_ip" '$0 ~ ip {print $2}')
+        bytes_out=$(iptables -nvxL QUOTA_OUT | awk -v ip="$user_ip" '$0 ~ ip {print $2}')
+        total_bytes=$((bytes_in + bytes_out))
+        total_mb=$((total_bytes / 1024 / 1024))
+        
+        # Update usage in database
+        awk -F: -v user="$username" -v used="$total_mb" \
+            'BEGIN{OFS=":"} $1==user {$3=used} {print}' "$QUOTA_DB" > "$QUOTA_DB.tmp" \
+            && mv "$QUOTA_DB.tmp" "$QUOTA_DB"
+        
+        # Check if quota exceeded
+        if [ "$total_mb" -ge "$quota_mb" ]; then
+            log "Quota exceeded for $username (used ${total_mb}MB of ${quota_mb}MB)"
+            disable_user_access "$username"
+        fi
+    done < "$QUOTA_DB"
+}
+
+disable_user_access() {
+    local username=$1
+    local user_ip=$(getent hosts "$username" | awk '{print $1}')
+    
+    if [ -z "$user_ip" ]; then
+        log "Error: Could not get IP for $username"
+        return 1
+    fi
+    
+    # Block all traffic for this user
+    if ! iptables -C FORWARD -s "$user_ip" -j DROP 2>/dev/null; then
+        iptables -A FORWARD -s "$user_ip" -j DROP
+        iptables -A FORWARD -d "$user_ip" -j DROP
+        log "Disabled network access for $username ($user_ip) due to quota limit"
+    fi
+}
+
+# =============================================
+# Bandwidth Management
+# =============================================
+
+manage_bandwidth() {
+    case $1 in
+        --set-limit)
+            local username=$2
+            local download_kbps=$3
+            local upload_kbps=$4
+            
+            if [ -z "$username" ] || [ -z "$download_kbps" ] || [ -z "$upload_kbps" ]; then
+                log "Error: Missing parameters for bandwidth limit"
+                return 1
+            fi
+            
+            # Check if user exists
+            if ! id "$username" >/dev/null 2>&1; then
+                log "Error: User $username does not exist"
+                return 1
+            fi
+            
+            # Install wondershaper if not installed
+            if ! command -v wondershaper >/dev/null; then
+                apt-get install -y wondershaper
+            fi
+            
+            # Get user's primary interface
+            local user_ip=$(getent hosts "$username" | awk '{print $1}')
+            if [ -z "$user_ip" ]; then
+                log "Error: Could not determine IP address for $username"
+                return 1
+            fi
+            
+            # Add to bandwidth database
+            echo "$username:$download_kbps:$upload_kbps:$user_ip" >> "$BANDWIDTH_DB"
+            
+            # Apply limits
+            apply_bandwidth_limits "$username" "$download_kbps" "$upload_kbps" "$user_ip"
+            log "Set bandwidth limits for $username: Down=${download_kbps}Kbps Up=${upload_kbps}Kbps"
+            ;;
+            
+        --remove-limit)
+            local username=$2
+            if [ -z "$username" ]; then
+                log "Error: Missing username"
+                return 1
+            fi
+            
+            # Remove from bandwidth database
+            sed -i "/^$username:/d" "$BANDWIDTH_DB"
+            
+            # Clear existing limits
+            clear_bandwidth_limits "$username"
+            log "Removed bandwidth limits for $username"
+            ;;
+            
+        --list-limits)
+            log "Current Bandwidth Limits:"
+            if [ ! -f "$BANDWIDTH_DB" ] || [ ! -s "$BANDWIDTH_DB" ]; then
+                log "No bandwidth limits configured"
+            else
+                printf "%-15s %-15s %-15s %-15s\n" "Username" "Download(Kbps)" "Upload(Kbps)" "IP Address"
+                while IFS=: read -r user down up ip; do
+                    printf "%-15s %-15s %-15s %-15s\n" "$user" "$down" "$up" "$ip"
+                done < "$BANDWIDTH_DB"
+            fi
+            ;;
+            
+        *)
+            log "Invalid bandwidth management option"
+            return 1
+            ;;
+    esac
+}
+
+apply_bandwidth_limits() {
+    local username=$1
+    local download=$2
+    local upload=$3
+    local ip=$4
+    
+    # Create HTB class for download
+    tc class add dev eth0 parent 1: classid 1:${username:0:8} htb rate ${download}kbit
+    
+    # Create filter to match traffic to this IP
+    tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 match ip dst $ip flowid 1:${username:0:8}
+    
+    # Create HTB class for upload (assuming eth1 is WAN interface)
+    tc class add dev eth1 parent 1: classid 1:${username:0:8} htb rate ${upload}kbit
+    
+    # Create filter to match traffic from this IP
+    tc filter add dev eth1 protocol ip parent 1:0 prio 1 u32 match ip src $ip flowid 1:${username:0:8}
+}
+
+clear_bandwidth_limits() {
+    local username=$1
+    
+    # Remove download limit
+    tc filter del dev eth0 parent 1:0 protocol ip prio 1 handle ::${username:0:8} u32
+    
+    # Remove upload limit
+    tc filter del dev eth1 parent 1:0 protocol ip prio 1 handle ::${username:0:8} u32
+}
+
+# =============================================
+# OpenVPN Management
+# =============================================
+
+manage_openvpn() {
+    case $1 in
+        --install)
+            log "Installing OpenVPN..."
+            apt-get install -y openvpn easy-rsa
+            
+            # Set up PKI
+            make-cadir $OPENVPN_DIR/easy-rsa
+            cd $OPENVPN_DIR/easy-rsa
+            ./easyrsa init-pki
+            ./easyrsa build-ca nopass
+            ./easyrsa gen-dh
+            openvpn --genkey --secret ta.key
+            
+            # Generate server cert
+            ./easyrsa build-server-full server nopass
+            
+            # Create server config
+            cat > $OPENVPN_DIR/server.conf <<EOF
+port 1194
+proto udp
+dev tun
+ca $OPENVPN_DIR/easy-rsa/pki/ca.crt
+cert $OPENVPN_DIR/easy-rsa/pki/issued/server.crt
+key $OPENVPN_DIR/easy-rsa/pki/private/server.key
+dh $OPENVPN_DIR/easy-rsa/pki/dh.pem
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 8.8.4.4"
+keepalive 10 120
+tls-auth $OPENVPN_DIR/easy-rsa/ta.key 0
+cipher AES-256-CBC
+comp-lzo
+persist-key
+persist-tun
+status openvpn-status.log
+verb 3
+EOF
+            
+            # Enable IP forwarding
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+            sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+            
+            # Configure firewall
+            iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+            iptables-save > /etc/iptables.rules
+            
+            # Enable and start service
+            systemctl enable openvpn@server
+            systemctl start openvpn@server
+            
+            log "OpenVPN installed and configured. Server config: $OPENVPN_DIR/server.conf"
+            ;;
+            
+        --add-client)
+            local clientname=$2
+            if [ -z "$clientname" ]; then
+                log "Error: Client name required"
+                return 1
+            fi
+            
+            if [ ! -d "$OPENVPN_DIR/easy-rsa" ]; then
+                log "Error: OpenVPN PKI not initialized. Run --install first"
+                return 1
+            fi
+            
+            cd $OPENVPN_DIR/easy-rsa
+            ./easyrsa build-client-full "$clientname" nopass
+            
+            # Create client config
+            cat > $OPENVPN_DIR/"$clientname".ovpn <<EOF
+client
+dev tun
+proto udp
+remote $(curl -s ifconfig.me) 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+comp-lzo
+verb 3
+<ca>
+$(cat $OPENVPN_DIR/easy-rsa/pki/ca.crt)
+</ca>
+<cert>
+$(openssl x509 -in $OPENVPN_DIR/easy-rsa/pki/issued/$clientname.crt)
+</cert>
+<key>
+$(cat $OPENVPN_DIR/easy-rsa/pki/private/$clientname.key)
+</key>
+<tls-auth>
+$(cat $OPENVPN_DIR/easy-rsa/ta.key)
+</tls-auth>
+key-direction 1
+EOF
+            
+            log "Created client config: $OPENVPN_DIR/$clientname.ovpn"
+            ;;
+            
+        --revoke-client)
+            local clientname=$2
+            if [ -z "$clientname" ]; then
+                log "Error: Client name required"
+                return 1
+            fi
+            
+            cd $OPENVPN_DIR/easy-rsa
+            ./easyrsa revoke "$clientname"
+            ./easyrsa gen-crl
+            
+            systemctl restart openvpn@server
+            log "Revoked client certificate for $clientname"
+            ;;
+            
+        --list-clients)
+            log "OpenVPN Clients:"
+            if [ ! -d "$OPENVPN_DIR/easy-rsa/pki/issued" ]; then
+                log "No clients configured"
+            else
+                ls $OPENVPN_DIR/easy-rsa/pki/issued/*.crt | sed 's/.*\///;s/\.crt//'
+            fi
+            ;;
+            
+        --start|--stop|--restart|--status)
+            local action=$(echo "$1" | sed 's/^--//')
+            systemctl $action openvpn@server
+            log "OpenVPN service $action"
+            ;;
+            
+        *)
+            log "Invalid OpenVPN option"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# PSAD Management (Port Scan Attack Detection)
+# =============================================
+
+manage_psad() {
+    case $1 in
+        --install)
+            log "Installing PSAD..."
+            apt-get install -y psad
+            
+            # Configure basic settings
+            sed -i 's/EMAIL_ADDRESSES\s*.*/EMAIL_ADDRESSES root@localhost;/' $PSAD_DIR/psad.conf
+            sed -i 's/HOSTNAME\s*.*/HOSTNAME $(hostname);/' $PSAD_DIR/psad.conf
+            sed -i 's/ENABLE_AUTO_IDS\s*.*/ENABLE_AUTO_IDS Y;/' $PSAD_DIR/psad.conf
+            sed -i 's/AUTO_IDS_DANGER_LEVEL\s*.*/AUTO_IDS_DANGER_LEVEL 3;/' $PSAD_DIR/psad.conf
+            
+            # Enable auto-blocking
+            sed -i 's/ENABLE_AUTO_IDS\s*.*/ENABLE_AUTO_IDS Y;/' $PSAD_DIR/psad.conf
+            
+            # Start and enable service
+            systemctl enable psad
+            systemctl start psad
+            
+            log "PSAD installed and configured. Edit $PSAD_DIR/psad.conf for further customization."
+            ;;
+            
+        --update)
+            if ! command -v psad >/dev/null; then
+                log "PSAD not installed. Use --install first"
+                return 1
+            fi
+            
+            psad --sig-update
+            systemctl restart psad
+            log "PSAD signatures updated"
+            ;;
+            
+        --status)
+            psad --Status
+            ;;
+            
+        --view-alerts)
+            tail -n 50 /var/log/psad/*alert
+            ;;
+            
+        --whitelist-ip)
+            local ip=$2
+            if [ -z "$ip" ]; then
+                log "Error: IP address required"
+                return 1
+            fi
+            
+            echo "$ip 0;" >> $PSAD_DIR/auto_dl
+            systemctl restart psad
+            log "Whitelisted IP $ip from PSAD blocking"
+            ;;
+            
+        --start|--stop|--restart)
+            local action=$(echo "$1" | sed 's/^--//')
+            systemctl $action psad
+            log "PSAD service $action"
+            ;;
+            
+        *)
+            log "Invalid PSAD option"
+            return 1
+            ;;
+    esac
+}
+
+
+# Web Filtering & Application Control
+# =============================================
+
+manage_webfilter() {
+    case $1 in
+        --enable)
+            # Install dependencies
+            apt-get install -y squid clamav dansguardian
+            
+            # Configure transparent proxy
+            iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3128
+            iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3129
+            
+            # Enable SSL inspection
+            if [[ "$2" == "--ssl-inspection" ]]; then
+                mkdir -p "$WEBFILTER_DIR/ssl"
+                openssl req -new -x509 -days 365 -nodes \
+                    -out "$WEBFILTER_DIR/ssl/squid-ca.pem" \
+                    -keyout "$WEBFILTER_DIR/ssl/squid-ca.key"
+                log "SSL inspection enabled. Install CA certificate on clients"
+            fi
+            
+            systemctl start squid dansguardian
+            log "Web filtering enabled"
+            ;;
+            
+        --add-rule)
+            local category=$2
+            local action=$3
+            local target=$4
+            
+            case $category in
+                --url)
+                    echo "$action $target" >> "$WEBFILTER_DIR/url_rules.acl"
+                    ;;
+                --app)
+                    echo "$action $target" >> "$WEBFILTER_DIR/app_rules.acl"
+                    ;;
+                --dns)
+                    echo "address=/$target/0.0.0.0" >> "$WEBFILTER_DIR/dns_block.conf"
+                    ;;
+                *)
+                    log "Invalid web filter category"
+                    return 1
+                    ;;
+            esac
+            log "Added $category filtering rule: $action $target"
+            ;;
+            
+        --update)
+            dansguardian-update
+            squid -k reconfigure
+            log "Web filter databases updated"
+            ;;
+            
+        *)
+            log "Invalid web filter option"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Advanced Threat Protection
+# =============================================
+
+manage_atp() {
+    case $1 in
+        --sandbox)
+            apt-get install -y cuckoo-sandbox
+            
+            if [[ "$2" == "--enable" ]]; then
+                systemctl start cuckoo
+                log "Sandboxing enabled. Files will be analyzed before delivery"
+            else
+                systemctl stop cuckoo
+                log "Sandboxing disabled"
+            fi
+            ;;
+            
+        --ips)
+            if [[ "$2" == "--auto-block" ]]; then
+                echo "auto-block: true" > "$ATP_DIR/ips.conf"
+                iptables -N IPS_BLOCK
+                iptables -A INPUT -j IPS_BLOCK
+                log "IPS auto-blocking enabled"
+            else
+                echo "auto-block: false" > "$ATP_DIR/ips.conf"
+                log "IPS auto-blocking disabled"
+            fi
+            ;;
+            
+        --update)
+            suricata-update
+            freshclam
+            log "Threat intelligence updated"
+            ;;
+            
+        *)
+            log "Invalid ATP option"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# High Availability
+# =============================================
+
+manage_ha() {
+    case $1 in
+        --enable)
+            local peer_ip=$2
+            local vip=$3
+            
+            # Install keepalived
+            apt-get install -y keepalived
+            
+            # Generate config
+            cat > /etc/keepalived/keepalived.conf <<EOF
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass freeutm
+    }
+    virtual_ipaddress {
+        $vip/24
+    }
+}
+EOF
+            
+            systemctl start keepalived
+            log "HA enabled with VIP $vip. Peer: $peer_ip"
+            ;;
+            
+        --status)
+            ip addr show | grep -A5 "eth0:"
+            systemctl status keepalived --no-pager
+            ;;
+            
+        *)
+            log "Invalid HA option"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# VPN Enhancements
+# =============================================
+
+manage_vpn() {
+    case $1 in
+        ipsec)
+            case $2 in
+                --add-connection)
+                    local name=$3
+                    local psk=$4
+                    local remote=$5
+                    
+                    cat >> /etc/ipsec.conf <<EOF
+conn $name
+    left=%defaultroute
+    leftid=@$(hostname)
+    right=$remote
+    rightid=@$remote
+    authby=secret
+    ike=aes256-sha2_256-modp2048!
+    esp=aes256-sha2_256!
+    keyingtries=0
+    ikelifetime=1h
+    lifetime=8h
+    dpddelay=30
+    dpdtimeout=120
+    dpdaction=restart
+    auto=start
+EOF
+                    
+                    echo "$remote : PSK \"$psk\"" >> /etc/ipsec.secrets
+                    systemctl restart ipsec
+                    log "IPSec VPN connection '$name' added"
+                    ;;
+                *)
+                    log "Invalid IPSec option"
+                    ;;
+            esac
+            ;;
+            
+        ssl)
+            case $2 in
+                --enable)
+                    apt-get install -y ocserv
+                    
+                    # Basic config
+                    sed -i 's/auth = "pam"/auth = "plain[passwd=\/etc\/ocserv\/ocpasswd]"/' /etc/ocserv/ocserv.conf
+                    echo "tcp-port = $3" >> /etc/ocserv/ocserv.conf
+                    
+                    systemctl start ocserv
+                    log "SSL VPN enabled on port $3"
+                    ;;
+                *)
+                    log "Invalid SSL VPN option"
+                    ;;
+            esac
+            ;;
+            
+        *)
+            log "Invalid VPN type"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Reporting System
+# =============================================
+
+generate_report() {
+    case $1 in
+        --threat)
+            local period=$2
+            local output_file="$REPORT_DIR/threat_report_$(date +%Y%m%d).pdf"
+            
+            # Collect data
+            local threats=$(grep -c "alert" /var/log/suricata/fast.log)
+            local blocks=$(iptables -L -n -v | grep DROP | awk '{print $1}')
+            
+            # Generate PDF (requires wkhtmltopdf)
+            echo "<h1>Threat Report</h1><p>Period: $period</p>" > temp.html
+            echo "<p>Threats detected: $threats</p>" >> temp.html
+            echo "<p>Packets blocked: $blocks</p>" >> temp.html
+            
+            wkhtmltopdf temp.html "$output_file"
+            rm temp.html
+            
+            log "Threat report generated: $output_file"
+            ;;
+            
+        --bandwidth)
+            local user=$2
+            local output_file="$REPORT_DIR/bandwidth_${user}_$(date +%Y%m%d).csv"
+            
+            # Get bandwidth usage
+            iptables -nvxL QUOTA_IN | grep "$user" > "$output_file"
+            iptables -nvxL QUOTA_OUT | grep "$user" >> "$output_file"
+            
+            log "Bandwidth report generated: $output_file"
+            ;;
+            
+        *)
+            log "Invalid report type"
+            return 1
+            ;;
+    esac
+}
+# =============================================
+# Main Help Function
+# =============================================
+show_help() {
+    cat << EOF
+freeutm v$VERSION - Unified Threat Management for Linux
+
+Usage: ./freeutm [CATEGORY] [ACTION] [OPTIONS]
+
+Scanning:
+  --scan antivirus --clamav             Run ClamAV scan
+  --scan antivirus --maldet             Run Maldet scan
+  --scan antivirus --rkhunter           Run RKHunter scan
+  --scan antivirus --yara               Run YARA scan
+  --scan antivirus --full               Run full system scan (all scanners)
+  --scan antivirus --update             Update all scanning databases
+
+Intrusion Detection/Prevention:
+  --ids suricata --start                Start Suricata IDS
+  --ids suricata --active-log           Show Suricata active log
+  --ids suricata --update               Update Suricata rules
+  --ids suricata --ips-mode             Configure Suricata in IPS mode
+  --ids suricata --add-rule "RULE"      Add custom rule to Suricata
+  --ids vulnerability --check           Run vulnerability check
+
+Firewall:
+  --firewall rule --add-port PORT --proto PROTO  Add port-based rule
+  --firewall rule --add-service SERVICE          Add service-based rule
+  --firewall panic --enable/--disable            Enable/disable panic mode
+
+Thread Monitoring:
+  --threads --add URL                  Add a new URL to thread monitoring
+  --threads --list                     List all monitored threads
+  --threads --remove ID                Remove a thread from monitoring
+
+Fail2Ban:
+  --fail2ban --start/--stop/--restart  Manage Fail2Ban service
+  --fail2ban --enable/--disable        Enable/disable at boot
+  --fail2ban --ban-ip IP               Manually ban an IP
+  --fail2ban --unban-ip IP             Manually unban an IP
+  --fail2ban --add-jail NAME SERVICE FILTER  Add custom jail
+  --fail2ban --list-banned             List all banned IPs
+  --fail2ban --config-test             Test configuration
+
+User Management:
+  --users --add USERNAME QUOTA_MB EXPIRY_DATE  Add user with internet quota
+  --users --remove USERNAME           Remove user and quota
+  --users --list                      List all users with quotas
+  --users --set-quota USERNAME MB     Update user's quota
+  --users --reset-usage USERNAME      Reset usage counter
+  --users --extend USERNAME DATE      Extend quota expiry date
+
+Bandwidth Management:
+  --bandwidth --set USERNAME DOWN UP  Set bandwidth limits (Kbps)
+  --bandwidth --remove USERNAME       Remove bandwidth limits
+  --bandwidth --list                  List all bandwidth limits
+
+VPN Management:
+  --vpn --install                     Install and configure OpenVPN
+  --vpn --add-client NAME             Generate client config
+  --vpn --revoke-client NAME          Revoke client certificate
+  --vpn --list-clients                List all VPN clients
+  --vpn --start/--stop/--status       Manage OpenVPN service
+
+PSAD (Port Scan Detection):
+  --psad --install                    Install and configure PSAD
+  --psad --update                     Update PSAD signatures
+  --psad --status                     Show PSAD status
+  --psad --view-alerts                View recent alerts
+  --psad --whitelist-ip IP            Whitelist IP from blocking
+  --psad --start/--stop/--restart     Manage PSAD service
+
+Service Management:
+  --service NAME --start/--stop/--restart/--status  Manage system services
+Web Filtering:
+  --webfilter --enable [--ssl-inspection]  Enable web filtering
+  --webfilter --add-rule --url (allow|block) DOMAIN
+  --webfilter --add-rule --app (allow|block) APP_NAME
+  --webfilter --add-rule --dns block DOMAIN
+  --webfilter --update                   Update filter databases
+
+Advanced Threat Protection:
+  --atp --sandbox --enable/--disable     Enable/disable sandboxing
+  --atp --ips --auto-block               Enable IPS auto-blocking
+  --atp --update                         Update threat intelligence
+
+High Availability:
+  --ha --enable PEER_IP VIP              Configure HA cluster
+  --ha --status                          Show HA status
+
+VPN Enhancements:
+  --vpn ipsec --add-connection NAME PSK REMOTE_IP  Add IPSec tunnel
+  --vpn ssl --enable PORT               Enable SSL VPN
+
+Reporting:
+  --report --threat PERIOD              Generate threat report
+  --report --bandwidth USER            Generate bandwidth report
+
+Examples:
+  ./freeutm --webfilter --enable --ssl-inspection
+  ./freeutm --webfilter --add-rule --url block facebook.com
+  ./freeutm --atp --sandbox --enable
+  ./freeutm --ha --enable 192.168.1.100 192.168.1.200
+  ./freeutm --vpn ipsec --add-connection Branch_Office secret_key 203.0.113.5
+  ./freeutm --report --threat weekly
+  ./freeutm --scan antivirus --full
+  ./freeutm --ids suricata --start
+  ./freeutm --ids suricata --add-rule 'alert tcp any any -> any any (msg:"Test Rule"; sid:1000001;)'
+  ./freeutm --firewall rule --add-port 22 --proto tcp
+  ./freeutm --firewall panic --enable
+  ./freeutm --threads --add "https://example.com"
+  ./freeutm --threads --list
+  ./freeutm --fail2ban --ban-ip 192.168.1.100
+  ./freeutm --users --add john 1024 2023-12-31
+  ./freeutm --bandwidth --set john 1024 512
+  ./freeutm --vpn --install
+  ./freeutm --service nginx --restart
+EOF
+}
+
+
+# =============================================
+# Main Execution
+# =============================================
+
+acquire_lock
+
+case $1 in
+    --help)
+        show_help
+        ;;
+        
+    --scan)
+        case $2 in
+            antivirus)
+                case $3 in
+                    --update)
+                        update_antivirus --full
+                        ;;
+                    --full)
+                        run_scan --clamav
+                        run_scan --maldet
+                        run_scan --rkhunter
+                        run_scan --yara
+                        ;;
+                    *)
+                        run_scan $3
+                        ;;
+                esac
+                ;;
+            *)
+                log "Invalid scan category"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --ids)
+        case $2 in
+            suricata)
+                manage_suricata $3 "$4"
+                ;;
+            vulnerability)
+                run_vuln_check
+                ;;
+            *)
+                log "Invalid IDS category"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --firewall)
+        case $2 in
+            rule)
+                manage_firewall --add-rule $3 $4 $5 $6
+                ;;
+            panic)
+                manage_firewall --panic-mode $3
+                ;;
+            *)
+                log "Invalid firewall option"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --threads)
+        case $2 in
+            --add)
+                add_thread "$3"
+                ;;
+            --list)
+                list_threads
+                ;;
+            --remove)
+                remove_thread "$3"
+                ;;
+            *)
+                log "Invalid thread management option"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --fail2ban)
+        manage_fail2ban $2 $3 $4 $5
+        ;;
+        
+    --users)
+        manage_users $2 $3 $4 $5
+        ;;
+        
+    --bandwidth)
+        case $2 in
+            --set)
+                manage_bandwidth --set-limit $3 $4 $5
+                ;;
+            --remove)
+                manage_bandwidth --remove-limit $3
+                ;;
+            --list)
+                manage_bandwidth --list-limits
+                ;;
+            *)
+                log "Invalid bandwidth option"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --vpn)
+        manage_openvpn $2 $3 $4
+        ;;
+        
+    --psad)
+        manage_psad $2 $3
+        ;;
+        
+    --service)
+        if [ $# -ge 3 ]; then
+            manage_service $2 $3
+        else
+            log "Invalid service command"
+            show_help
+        fi
+        ;;
+        
+    *)
+        log "Invalid option: $1"
+        show_help
+        ;;
+    --webfilter)
+        manage_webfilter "${@:2}"
+        ;;
+        
+    --atp)
+        manage_atp "${@:2}"
+        ;;
+        
+    --ha)
+        manage_ha "${@:2}"
+        ;;
+        
+    --vpn)
+        manage_vpn "${@:2}"
+        ;;
+        
+    --report)
+        generate_report "${@:2}"
+        ;;
+        
+    *)
+        log "Invalid option: $1"
+        show_help
+        ;;
+esac
+
+release_lock
+exit 0
