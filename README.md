@@ -1,9 +1,6 @@
-Based on your script's switches and functionality, I'll help optimize the README.md to better match your actual capabilities. Here's the improved version:
-
-```markdown
 # myUTM - Enterprise-Grade Unified Threat Management Solution
 
-![UTM Logo](https://www.clipartmax.com/png/middle/326-3266663_gnu-linux-gnu-linux-logo-png.png)  
+![UTM Logo](./firewall.jpg)
 **Open-Source Network Security Platform for Modern Enterprises**
 
 ## Table of Contents
