@@ -1,0 +1,294 @@
+#!/bin/bash
+
+# UTM Configuration Script
+# Unified Threat Management System Setup
+# Version: 1.0.0
+
+
+echo "Start configure NGFW. Please Wait ..."
+
+
+CONFIG_LOG="/var/log/utm_config.log"
+EMAIL_ADDRESS="admin@example.com"
+
+# Initialize logging
+init_logging() {
+    echo "=============================================" > $CONFIG_LOG
+    echo "UTM Configuration Log - $(date)" >> $CONFIG_LOG
+    echo "=============================================" >> $CONFIG_LOG
+}
+
+# Record configuration step
+log_step() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $CONFIG_LOG
+    echo "$1"
+}
+
+# Install basic dependencies
+install_basics() {
+    log_step "Installing basic dependencies..."
+    apt-get update >> $CONFIG_LOG 2>&1
+    apt-get install -y --no-install-recommends \
+        mailutils git wget curl wondershaper jq \
+        iptables-persistent ipset psad squid ethtool >> $CONFIG_LOG 2>&1
+
+    sudo apt-get install \
+        git autoconf automake libtool make libreadline-dev texinfo \
+        pkg-config libpam0g-dev libjson-c-dev bison flex \
+        libc-ares-dev python3-dev python3-sphinx \
+        install-info build-essential libsnmp-dev perl \
+        libcap-dev libelf-dev libunwind-dev \
+        protobuf-c-compiler libprotobuf-c-dev >> $CONFIG_LOG 2>&1
+
+    add-apt-repository -y ppa:oisf/suricata-stable >> $CONFIG_LOG 2>&1
+    apt-get update >> $CONFIG_LOG 2>&1
+    apt-get install -y suricata >> $CONFIG_LOG 2>&1
+    systemctl stop suricata
+}
+
+# Configure email alerts
+setup_email_alerts() {
+    log_step "Configuring email alerts..."
+
+    # iptables alerts
+    echo "* * * * * root tail -n 20 /var/log/syslog | grep 'Dropped:' | mail -s 'Critical iptables Event' $EMAIL_ADDRESS" >> /etc/crontab
+
+    # Maldet configuration
+    if [ -f "/usr/local/maldetect/conf.maldet" ]; then
+        sed -i "s/^email_alert=\"0\"/email_alert=\"1\"/" /usr/local/maldetect/conf.maldet
+        sed -i "s/^email_addr=\"\"/email_addr=\"$EMAIL_ADDRESS\"/" /usr/local/maldetect/conf.maldet
+    fi
+
+    # Rkhunter configuration
+    sed -i "s/^MAIL_ON_WARNINGS=.*/MAIL_ON_WARNINGS=\"yes\"/" /etc/rkhunter.conf
+    sed -i "s|^MAIL_CMD=.*|MAIL_CMD=\"mail -s \\\"rkhunter alert\\\" $EMAIL_ADDRESS\"|" /etc/rkhunter.conf
+
+    # Daily scan jobs
+    echo "0 2 * * * /usr/local/maldetect/maldet --scan-all / --quiet --log-file=/var/log/maldet-scan.log" >> /etc/crontab
+    echo "0 3 * * * /usr/bin/rkhunter --check --cronjob --report-warnings-only" >> /etc/crontab
+}
+
+# Configure firewall
+setup_firewall() {
+    log_step "Configuring firewall..."
+
+    netfilter-persistent save >> $CONFIG_LOG 2>&1
+    netfilter-persistent reload >> $CONFIG_LOG 2>&1
+
+    # Basic rules
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -A INPUT -j DROP
+
+    # Rate limiting
+    iptables -A INPUT -p tcp --dport 22 -m limit --limit 3/min --limit-burst 5 -j ACCEPT
+    iptables -A INPUT -j LOG --log-prefix "Dropped: " --log-level 4
+    iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+    # Intrusion prevention
+    iptables -A INPUT -p tcp --dport 22 -i eth0 -m recent --set --name SSH
+    iptables -A INPUT -p tcp --dport 22 -i eth0 -m recent --rcheck --seconds 60 --hitcount 5 -j DROP
+
+    # Save rules
+    iptables-save > /etc/iptables/rules.v4
+
+    # Configure PSAD
+    sed -i '/^ENABLE_AUTO_IDS/c\ENABLE_AUTO_IDS Y;' /etc/psad/psad.conf
+    sed -i '/^AUTO_IDS_TCP_PORTS/c\AUTO_IDS_TCP_PORTS any;' /etc/psad/psad.conf
+    sed -i '/^AUTO_IDS_UDP_PORTS/c\AUTO_IDS_UDP_PORTS any;' /etc/psad/psad.conf
+    psad --sig-update >> $CONFIG_LOG 2>&1
+    systemctl restart psad >> $CONFIG_LOG 2>&1
+}
+
+# Configure network kernel parameters
+setup_kernel_params() {
+    log_step "Configuring kernel parameters..."
+
+    cat > /etc/sysctl.d/99-utm.conf <<EOL
+# Connection tracking
+net.netfilter.nf_conntrack_max=262144
+net.ipv4.tcp_fin_timeout=30
+
+# Memory settings
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+
+# Security settings
+net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+
+# TCP tuning
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 16384 16777216
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_max_syn_backlog=4096
+net.core.somaxconn=1024
+
+# IPv6 disable
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+EOL
+
+    sysctl -p /etc/sysctl.d/99-utm.conf >> $CONFIG_LOG 2>&1
+}
+
+# Configure IDS/IPS systems
+setup_ids_ips() {
+    log_step "Configuring IDS/IPS systems..."
+
+    # Suricata configuration
+    suricata-update >> $CONFIG_LOG 2>&1
+    suricata-update update-sources >> $CONFIG_LOG 2>&1
+    suricata-update enable-source et/open >> $CONFIG_LOG 2>&1
+    suricata-update enable-source oisf/trafficid >> $CONFIG_LOG 2>&1
+    suricata-update >> $CONFIG_LOG 2>&1
+
+    # Custom rules
+    mkdir -p /etc/suricata/rules
+    echo 'alert tcp any any -> any any (msg:"SURICATA Custom Rule - TCP Traffic Detected"; sid:1000001; rev:1;)' > /etc/suricata/rules/custom.rules
+
+    # Update config
+    sed -i '/rule-files:/a \  - custom.rules' /etc/suricata/suricata.yaml
+    sed -i 's/^# \(nfqueue:\).*/\1 yes/' /etc/suricata/suricata.yaml
+    sed -i 's/^# \(nfqueue-mode:\).*/\1 accept/' /etc/suricata/suricata.yaml
+
+    # Enable eve-log
+    sed -i 's/^\(eve-log:\)$/\1\n  enabled: yes\n  filetype: regular\n  filename: eve.json\n  types:\n    - alert\n    - http\n    - dns\n    - tls\n    - files\n    - smtp\n    - flow\n    - stats/' /etc/suricata/suricata.yaml
+}
+
+# Configure antivirus systems
+setup_antivirus() {
+    log_step "Configuring antivirus systems..."
+
+    # ClamAV
+    apt-get install -y clamav >> $CONFIG_LOG 2>&1
+    systemctl stop clamav-freshclam
+    freshclam >> $CONFIG_LOG 2>&1
+    systemctl start clamav-freshclam
+
+    # Maldet
+    wget -q -O /tmp/maldetect.tar.gz http://www.rfxn.com/downloads/maldetect-current.tar.gz
+    tar xfz /tmp/maldetect.tar.gz -C /tmp
+    cd /tmp/maldetect-* && ./install.sh >> $CONFIG_LOG 2>&1
+    sed -i "s/^email_alert=\"0\"/email_alert=\"1\"/" /usr/local/maldetect/conf.maldet
+    sed -i "s/^email_addr=\"\"/email_addr=\"$EMAIL_ADDRESS\"/" /usr/local/maldetect/conf.maldet
+    /usr/local/sbin/maldet --mkpubpaths >> $CONFIG_LOG 2>&1
+
+    echo "Setting up daily scan cron job..."
+    echo "0 2 * * * /usr/local/maldetect/maldet --scan-all / --quiet --log-file=/var/log/maldet-scan.log" | sudo tee -a /etc/crontab
+
+    # Rkhunter
+    apt-get install -y rkhunter >> $CONFIG_LOG 2>&1
+    sed -i 's/^ALLOW_SSH_ROOT_USER=.*/ALLOW_SSH_ROOT_USER=0/' /etc/rkhunter.conf
+
+    # Chkrootkit
+    apt-get install -y chkrootkit >> $CONFIG_LOG 2>&1
+
+    # YARA
+    apt-get install -y yara >> $CONFIG_LOG 2>&1
+    git clone https://github.com/iomoath/yara-scanner.git /opt/yara-scanner >> $CONFIG_LOG 2>&1
+    cd /opt/yara-scanner
+    python3 -m venv venv
+    venv/bin/pip install yara-python >> $CONFIG_LOG 2>&1
+}
+
+# Configure monitoring
+setup_monitoring() {
+    log_step "Configuring monitoring..."
+
+    apt-get install -y netdata >> $CONFIG_LOG 2>&1
+    PUBLIC_IP=$(hostname -I | awk '{print $1}')
+    sed -i "s/^bind socket to IP = 127.0.0.1$/bind socket to IP = $PUBLIC_IP/" /etc/netdata/netdata.conf
+    systemctl restart netdata >> $CONFIG_LOG 2>&1
+    iptables -A INPUT -p tcp --dport 19999 -j ACCEPT
+}
+
+fail2ban(){
+
+    sudo apt install fail2ban -y
+    cd /etc/fail2ban/
+    sudo cp jail.conf jail.local
+
+
+    sudo sed -i '/^ignoreip/c\ignoreip = 127.0.0.1/8 ::1 123.123.123.123 192.168.1.0/24' /etc/fail2ban/jail.local
+
+    sudo sed -i '/^bantime/c\bantime  = 1d' /etc/fail2ban/jail.local
+    sudo sed -i '/^findtime/c\findtime  = 10m' /etc/fail2ban/jail.local
+    sudo sed -i '/^maxretry/c\maxretry = 5' /etc/fail2ban/jail.local
+    sudo sed -i '/^action/c\action = %(action_mw)s' /etc/fail2ban/jail.local
+
+
+    sudo sed -i '/^\[proftpd\]/!a [proftpd]\nenabled  = true\nport     = ftp,ftp-data,ftps,ftps-data\nlogpath  = %(proftpd_log)s\nbackend  = %(proftpd_backend)s' /etc/fail2ban/jail.local
+
+
+    sudo sed -i '/^\[sshd\]/!a [sshd]\nenabled   = true\nmaxretry  = 3\nfindtime  = 1d\nbantime   = 4w\nignoreip  = 127.0.0.1/8 23.34.45.56' /etc/fail2ban/jail.local
+
+
+}
+
+
+configure_vul_scanner(){
+	sudo apt install lynis -y
+}
+
+
+# System hardening
+harden_system() {
+    log_step "Hardening system..."
+
+    # SSH hardening
+    sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+    systemctl restart sshd
+
+    # Automatic updates
+    apt-get install -y unattended-upgrades >> $CONFIG_LOG 2>&1
+    dpkg-reconfigure -f noninteractive unattended-upgrades >> $CONFIG_LOG 2>&1
+    systemctl enable unattended-upgrades
+    systemctl start unattended-upgrades
+}
+
+# Main execution
+main() {
+    init_logging
+
+    # Installation and configuration steps
+    install_basics
+    setup_email_alerts
+    setup_firewall
+    setup_kernel_params
+    setup_ids_ips
+    setup_antivirus
+    setup_monitoring
+    harden_system
+    fail2ban
+    configure_vul_scanner
+
+    # Final report
+    echo ""
+    echo "============================================="
+    echo "UTM Configuration Complete"
+    echo "============================================="
+    echo "Detailed log available at: $CONFIG_LOG"
+    echo ""
+    echo "Services configured:"
+    echo "- Firewall with IPTables and PSAD"
+    echo "- Suricata IDS/IPS"
+    echo "- ClamAV, Maldet, Rkhunter antivirus"
+    echo "- Netdata monitoring (port 19999)"
+    echo "- System hardening applied"
+    echo ""
+    echo "Next steps:"
+    echo "1. Review configuration at $CONFIG_LOG"
+    echo "2. Reboot the system to apply all changes"
+    echo "3. Access Netdata dashboard at http://$(hostname -I | awk '{print $1}'):19999"
+}
+
+# Execute main function
+main
