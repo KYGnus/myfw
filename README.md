@@ -1,4 +1,4 @@
-# myUTM - Enterprise-Grade Unified Threat Management Solution
+# myFW - Enterprise-Grade NGFW
 
 ![UTM Logo](./firewall.jpg)
 **Open-Source Network Security Platform for Modern Enterprises**
