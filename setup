@@ -1,0 +1,316 @@
+#!/bin/bash
+
+# NGFW Auto-Installer - One-Step Setup for Next-Generation Firewall
+# Version: 1.0.0
+
+# Check root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root (use sudo)" >&2
+  exit 1
+fi
+
+# Configuration
+CONFIG_DIR="/etc/myfw"
+LOG_DIR="/var/log/myfw"
+MALTRAIL_DIR="/opt/maltrail"
+
+# Setup logging
+exec > >(tee -a /var/log/ngfw-installer.log) 2>&1
+echo "=== Starting NGFW Installation $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+# System Update
+echo "[1/9] Updating system packages..."
+apt-get update && apt-get upgrade -y
+
+# Install Python 3.11
+echo "[2/9] Installing Python 3.11..."
+apt-get install -y software-properties-common
+add-apt-repository ppa:deadsnakes/ppa -y
+apt-get update
+apt-get install -y python3.11 python3.11-dev python3.11-venv python3-pip
+update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# Install Dependencies
+echo "[3/9] Installing dependencies..."
+apt-get install -y firewalld suricata suricata-update fail2ban netdata \
+                  git mailutils iptables-persistent
+
+# Create Directories
+echo "[4/9] Creating directories..."
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$MALTRAIL_DIR"
+chmod 750 "$CONFIG_DIR" "$LOG_DIR"
+
+# Configure Firewall
+echo "[5/9] Configuring firewalld..."
+systemctl enable --now firewalld
+firewall-cmd --set-default-zone=public
+firewall-cmd --zone=public --add-service=ssh --permanent
+firewall-cmd --zone=public --add-port=19999/tcp --permanent  # Netdata
+firewall-cmd --reload
+
+# Install Maltrail
+echo "[6/9] Installing Maltrail..."
+if [ ! -d "$MALTRAIL_DIR" ]; then
+  git clone https://github.com/stamparm/maltrail.git "$MALTRAIL_DIR"
+  cd "$MALTRAIL_DIR" || exit
+  python3.11 -m pip install -r requirements.txt
+  
+  # Create services using python3.11
+  cat > /etc/systemd/system/maltrail-sensor.service <<EOF
+[Unit]
+Description=Maltrail Sensor
+After=network.target
+
+[Service]
+WorkingDirectory=$MALTRAIL_DIR
+ExecStart=/usr/bin/sudo /usr/bin/python3.11 sensor.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/maltrail-server.service <<EOF
+[Unit]
+Description=Maltrail Server
+After=network.target
+
+[Service]
+WorkingDirectory=$MALTRAIL_DIR
+ExecStart=/usr/bin/sudo /usr/bin/python3.11 server.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now maltrail-server maltrail-sensor
+fi
+
+# Configure Suricata
+echo "[7/9] Configuring Suricata..."
+if [ ! -f /etc/suricata/suricata.yaml ]; then
+  cp /usr/share/suricata/suricata.yaml /etc/suricata/suricata.yaml
+fi
+
+# Update rules
+suricata-update
+touch /etc/suricata/rules/local.rules
+chmod 640 /etc/suricata/rules/local.rules
+
+# Configure Fail2Ban
+echo "[8/9] Configuring Fail2Ban..."
+cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8
+bantime = 3600
+findtime = 600
+maxretry = 3
+
+[sshd]
+enabled = true
+
+[maltrail]
+enabled = true
+port = anyport
+filter = maltrail
+logpath = /var/log/maltrail/sensor.log
+maxretry = 1
+findtime = 3600
+bantime = 86400
+action = iptables-allports[name=maltrail, protocol=all]
+EOF
+
+cat > /etc/fail2ban/filter.d/maltrail.conf <<EOF
+[Definition]
+failregex = ^.*Suspicious.*<HOST>.*$
+ignoreregex =
+EOF
+
+# Final Configuration
+echo "[9/9] Finalizing setup..."
+
+# Create email config template
+cat > "$CONFIG_DIR/email.conf" <<EOF
+# Email configuration for NGFW alerts
+ALERT_EMAIL="admin@example.com"
+EOF
+chmod 600 "$CONFIG_DIR/email.conf"
+
+# Install NGFW control script
+cat > /usr/local/bin/myfw <<'EOF'
+#!/bin/bash
+
+# myfw - Next-Generation Firewall Control Script
+# Auto-generated during installation
+
+# Placeholder for firewall control logic
+echo "NGFW Control Script"
+echo "Usage: $0 {start|stop|status|restart}"
+# Add your firewall control logic here
+EOF
+
+chmod 750 /usr/local/bin/myfw
+
+# Enable all services
+systemctl enable --now suricata fail2ban netdata
+
+# Backup existing sysctl.conf
+cp /etc/sysctl.conf /etc/sysctl.conf.bak
+
+# Append enterprise-grade kernel optimizations with explanations
+cat >> /etc/sysctl.conf <<EOF
+# Enterprise NGFW Kernel Optimizations
+
+# Socket buffer sizes for high-throughput networks
+# net.core.rmem_max: Maximum receive socket buffer size (bytes), for high-bandwidth networks
+net.core.rmem_max=33554432
+# net.core.wmem_max: Maximum send socket buffer size (bytes), for high-bandwidth networks
+net.core.wmem_max=33554432
+# net.core.rmem_default: Default receive socket buffer size (bytes), balanced for most connections
+net.core.rmem_default=8388608
+# net.core.wmem_default: Default send socket buffer size (bytes), balanced for most connections
+net.core.wmem_default=8388608
+# net.core.optmem_max: Maximum ancillary buffer size for socket options, supports larger socket structures
+net.core.optmem_max=81920
+
+# TCP connection handling
+# net.ipv4.tcp_syncookies: Enables SYN cookies to protect against SYN flood attacks
+net.ipv4.tcp_syncookies=1
+# net.ipv4.tcp_max_syn_backlog: Maximum number of queued connection requests, handles high connection rates
+net.ipv4.tcp_max_syn_backlog=16384
+# net.core.somaxconn: Maximum listen queue for incoming connections, critical for high-traffic servers
+net.core.somaxconn=131072
+# net.ipv4.tcp_tw_reuse: Allows reusing TIME_WAIT sockets for new connections, reduces resource waste
+net.ipv4.tcp_tw_reuse=1
+# net.ipv4.tcp_tw_recycle: Disabled to avoid issues with NAT and modern networks
+net.ipv4.tcp_tw_recycle=0
+# net.ipv4.tcp_fin_timeout: Time (seconds) to hold sockets in FIN_WAIT state, reduced to free resources
+net.ipv4.tcp_fin_timeout=15
+# net.ipv4.tcp_keepalive_time: Time (seconds) before sending keepalive probes, detects dead connections
+net.ipv4.tcp_keepalive_time=300
+# net.ipv4.tcp_keepalive_probes: Number of unacknowledged probes before connection is closed
+net.ipv4.tcp_keepalive_probes=5
+# net.ipv4.tcp_keepalive_intvl: Interval (seconds) between keepalive probes
+net.ipv4.tcp_keepalive_intvl=15
+
+# Connection tracking for large-scale traffic
+# net.netfilter.nf_conntrack_max: Maximum number of tracked connections, supports large-scale traffic
+net.netfilter.nf_conntrack_max=262144
+# net.nf_conntrack_max: Alias for nf_conntrack_max, ensures compatibility
+net.nf_conntrack_max=262144
+# net.ipv4.netfilter.ip_conntrack_tcp_timeout_established: Timeout (seconds) for established TCP connections
+net.ipv4.netfilter.ip_conntrack_tcp_timeout_established=3600
+# net.ipv4.netfilter.ip_conntrack_tcp_timeout_close_wait: Timeout (seconds) for CLOSE_WAIT state, frees resources
+net.ipv4.netfilter.ip_conntrack_tcp_timeout_close_wait=60
+
+# Mitigate DDoS and improve performance under load
+# net.ipv4.tcp_max_orphans: Maximum orphaned TCP sockets, prevents memory exhaustion
+net.ipv4.tcp_max_orphans=32768
+# net.ipv4.ip_local_port_range: Range of ephemeral ports for outgoing connections, supports more connections
+net.ipv4.ip_local_port_range=1024 65535
+# net.ipv4.tcp_rfc1337: Protects against TIME_WAIT assassination attacks per RFC 1337
+net.ipv4.tcp_rfc1337=1
+# net.ipv4.tcp_low_latency: Prioritizes low latency over throughput, critical for firewall responsiveness
+net.ipv4.tcp_low_latency=1
+# net.ipv4.tcp_adv_win_scale: TCP window scaling factor, optimizes buffer allocation
+net.ipv4.tcp_adv_win_scale=1
+# net.ipv4.tcp_window_scaling: Enables TCP window scaling for better performance on high-latency links
+net.ipv4.tcp_window_scaling=1
+# net.ipv4.tcp_sack: Enables Selective Acknowledgment, improves performance on lossy networks
+net.ipv4.tcp_sack=1
+# net.ipv4.tcp_fack: Enables Forward Acknowledgment, enhances congestion control
+net.ipv4.tcp_fack=1
+# net.core.netdev_max_backlog: Maximum packets in input queue per CPU, handles high-speed interfaces
+net.core.netdev_max_backlog=5000
+
+# Disable IPv6 if not needed (optional, comment out if IPv6 is required)
+# net.ipv6.conf.all.disable_ipv6: Disables IPv6 on all interfaces to reduce attack surface
+net.ipv6.conf.all.disable_ipv6=1
+# net.ipv6.conf.default.disable_ipv6: Disables IPv6 on default interfaces
+net.ipv6.conf.default.disable_ipv6=1
+# net.ipv6.conf.lo.disable_ipv6: Disables IPv6 on loopback interface
+net.ipv6.conf.lo.disable_ipv6=1
+
+# Memory and CPU optimizations
+# vm.swappiness: Reduces swapping tendency, prioritizes RAM for firewall processes
+vm.swappiness=10
+# vm.dirty_ratio: Percentage of system memory for dirty pages before flush, optimizes write performance
+vm.dirty_ratio=15
+# vm.dirty_background_ratio: Percentage of memory for background writeback, improves I/O performance
+vm.dirty_background_ratio=5
+# kernel.sched_migration_cost_ns: CPU migration cost (nanoseconds), reduces overhead on multi-core systems
+kernel.sched_migration_cost_ns=5000000
+# kernel.sched_autogroup_enabled: Disables process autogrouping to prioritize firewall tasks
+kernel.sched_autogroup_enabled=0
+
+# Security hardening
+# net.ipv4.conf.all.rp_filter: Enables reverse path filtering to prevent IP spoofing
+net.ipv4.conf.all.rp_filter=1
+# net.ipv4.conf.default.rp_filter: Enables reverse path filtering for default interfaces
+net.ipv4.conf.default.rp_filter=1
+# net.ipv4.conf.all.accept_redirects: Disables ICMP redirects to prevent man-in-the-middle attacks
+net.ipv4.conf.all.accept_redirects=0
+# net.ipv4.conf.default.accept_redirects: Disables ICMP redirects for default interfaces
+net.ipv4.conf.default.accept_redirects=0
+# net.ipv4.conf.all.secure_redirects: Disables secure ICMP redirects for added security
+net.ipv4.conf.all.secure_redirects=0
+# net.ipv4.conf.default.secure_redirects: Disables secure ICMP redirects for default interfaces
+net.ipv4.conf.default.secure_redirects=0
+# net.ipv4.conf.all.send_redirects: Prevents sending ICMP redirects to avoid network exposure
+net.ipv4.conf.all.send_redirects=0
+# net.ipv4.conf.default.send_redirects: Prevents sending ICMP redirects for default interfaces
+net.ipv4.conf.default.send_redirects=0
+# net.ipv4.icmp_echo_ignore_broadcasts: Ignores ICMP broadcast pings to mitigate smurf attacks
+net.ipv4.icmp_echo_ignore_broadcasts=1
+# net.ipv4.icmp_ignore_bogus_error_responses: Ignores invalid ICMP error responses for security
+net.ipv4.icmp_ignore_bogus_error_responses=1
+# net.ipv4.conf.all.log_martians: Logs packets with invalid source addresses for debugging
+net.ipv4.conf.all.log_martians=1
+EOF
+
+# Apply the changes
+sysctl -p
+
+# Disable NIC offloading
+for iface in $(ip link | awk -F: '$0 !~ "lo|vir|docker" {print $2}' | tr -d ' '); do
+  ethtool -K $iface tso off gso off gro off
+done
+
+# Create log rotation
+cat > /etc/logrotate.d/ngfw <<EOF
+/var/log/myfw/*.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 640 root adm
+}
+
+/var/log/maltrail/*.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 640 root adm
+}
+EOF
+
+# Increase file descriptors
+echo "* soft nofile 65535" >> /etc/security/limits.conf
+echo "* hard nofile 65535" >> /etc/security/limits.conf
+
+echo "=== NGFW Installation Complete ==="
+echo "System will automatically:"
+echo " - Block malicious traffic (Fail2Ban + Maltrail)"
+echo " - Detect intrusions (Suricata)"
+echo " - Monitor system (Netdata)"
+echo ""
+echo "Access Netdata dashboard at: http://$(hostname -I | awk '{print $1}'):19999"
+echo "Control the firewall with: myfw --help"
+echo "Installation log: /var/log/ngfw-installer.log"

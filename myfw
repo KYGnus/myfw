@@ -1,0 +1,639 @@
+#!/bin/bash
+
+# myfw - Next-Generation Firewall for Linux Systems
+
+VERSION="1.0.0"
+CONFIG_DIR="/etc/myfw"
+LOG_DIR="/var/log/myfw"
+SURICATA_RULES_DIR="/etc/suricata/rules"
+MALTRAIL_DIR="/var/log/maltrail"
+LOCK_FILE="/var/lock/myfw.lock"
+
+# Ensure script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root" >&2
+    exit 1
+fi
+
+# Create necessary directories
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SURICATA_RULES_DIR" "$MALTRAIL_DIR"
+
+# Initialize logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/myfw.log"
+}
+
+# Acquire lock to prevent multiple instances
+acquire_lock() {
+    exec 200>$LOCK_FILE
+    flock -n 200 || {
+        log "Another instance is already running. Exiting."
+        exit 1
+    }
+    echo $$ >&200
+}
+
+release_lock() {
+    flock -u 200
+    rm -f $LOCK_FILE
+}
+
+# Email notification function
+send_alert() {
+    local subject=$1
+    local message=$2
+    if [ -f "$CONFIG_DIR/email.conf" ]; then
+        source "$CONFIG_DIR/email.conf"
+        echo "$message" | mail -s "$subject" "$ALERT_EMAIL"
+    else
+        log "Email alert not configured. Create $CONFIG_DIR/email.conf with ALERT_EMAIL variable."
+    fi
+}
+
+# =============================================
+# IDS/IPS Functions
+# =============================================
+
+manage_suricata() {
+    case $1 in
+        --start)
+            if ! command -v suricata >/dev/null; then
+                log "Suricata not installed. Install with: apt install suricata"
+                return 1
+            fi
+            
+            local interface=$(ip -o -4 route show to default | awk '{print $5}')
+            if [ -z "$interface" ]; then
+                log "Could not determine network interface"
+                return 1
+            fi
+            
+            # Check if Suricata is already running
+            if pgrep -x "suricata" >/dev/null; then
+                log "Suricata is already running"
+                return 0
+            fi
+            
+            # Start Suricata
+            suricata -c /etc/suricata/suricata.yaml -i $interface -D
+            if [ $? -eq 0 ]; then
+                log "Suricata started on interface $interface"
+            else
+                log "Failed to start Suricata"
+                return 1
+            fi
+            ;;
+        --active-log)
+            if [ ! -f "/var/log/suricata/fast.log" ]; then
+                log "Suricata log file not found. Is Suricata running?"
+                return 1
+            fi
+            tail -f /var/log/suricata/fast.log
+            ;;
+        --update)
+            if ! command -v suricata-update >/dev/null; then
+                log "suricata-update not found. Install Suricata first."
+                return 1
+            fi
+            
+            suricata-update
+            if [ $? -eq 0 ]; then
+                log "Suricata rules updated"
+                
+                # Reload Suricata if running
+                if pgrep -x "suricata" >/dev/null; then
+                    kill -USR2 $(pidof suricata)
+                    log "Suricata rules reloaded"
+                fi
+            else
+                log "Failed to update Suricata rules"
+                return 1
+            fi
+            ;;
+        --ips-mode)
+            # Enable IPS mode by enabling NFQUEUE
+            if ! grep -q "nfqueue" /etc/suricata/suricata.yaml; then
+                sed -i '/^ *- detect-protocols:/a \    - af-packet\n    - nfqueue' /etc/suricata/suricata.yaml
+                log "NFQUEUE enabled in Suricata configuration"
+                
+                # Restart Suricata if running
+                if pgrep -x "suricata" >/dev/null; then
+                    pkill -9 suricata
+                    manage_suricata --start
+                fi
+                
+                # Configure iptables to send traffic to NFQUEUE
+                iptables -I INPUT -j NFQUEUE --queue-bypass
+                iptables -I OUTPUT -j NFQUEUE --queue-bypass
+                iptables -I FORWARD -j NFQUEUE --queue-bypass
+                log "IPTables configured for IPS mode"
+            else
+                log "Suricata already configured for IPS mode"
+            fi
+            ;;
+        --add-rule)
+            if [ -z "$2" ]; then
+                log "No rule provided"
+                return 1
+            fi
+            
+            # Validate rule syntax
+            if ! echo "$2" | grep -qE '^alert\s+'; then
+                log "Invalid Suricata rule format. Must start with 'alert'"
+                return 1
+            fi
+            
+            # Add rule to local rules file
+            echo "$2" >> "$SURICATA_RULES_DIR/local.rules"
+            
+            # Reload rules if Suricata is running
+            if pgrep -x "suricata" >/dev/null; then
+                kill -USR2 $(pidof suricata)
+                log "Added rule to Suricata and reloaded rules: $2"
+            else
+                log "Added rule to Suricata (service not running): $2"
+            fi
+            ;;
+        *)
+            log "Invalid Suricata action"
+            return 1
+            ;;
+    esac
+}
+
+manage_maltrail() {
+    case $1 in
+        --start)
+            if ! command -v maltrail-server >/dev/null; then
+                log "Maltrail not installed. Clone from https://github.com/stamparm/maltrail"
+                return 1
+            fi
+            
+            if pgrep -f "maltrail-server" >/dev/null; then
+                log "Maltrail server is already running"
+                return 0
+            fi
+            
+            # Start maltrail server
+            maltrail-server > "$MALTRAIL_DIR/server.log" 2>&1 &
+            sleep 2
+            
+            if pgrep -f "maltrail-server" >/dev/null; then
+                log "Maltrail server started"
+            else
+                log "Failed to start Maltrail server"
+                return 1
+            fi
+            
+            # Start maltrail sensor
+            if pgrep -f "maltrail-sensor" >/dev/null; then
+                log "Maltrail sensor is already running"
+                return 0
+            fi
+            
+            maltrail-sensor > "$MALTRAIL_DIR/sensor.log" 2>&1 &
+            sleep 2
+            
+            if pgrep -f "maltrail-sensor" >/dev/null; then
+                log "Maltrail sensor started"
+            else
+                log "Failed to start Maltrail sensor"
+                return 1
+            fi
+            ;;
+        --stop)
+            pkill -f "maltrail-server"
+            pkill -f "maltrail-sensor"
+            log "Maltrail server and sensor stopped"
+            ;;
+        --status)
+            if pgrep -f "maltrail-server" >/dev/null; then
+                echo "Maltrail server: RUNNING"
+            else
+                echo "Maltrail server: STOPPED"
+            fi
+            
+            if pgrep -f "maltrail-sensor" >/dev/null; then
+                echo "Maltrail sensor: RUNNING"
+            else
+                echo "Maltrail sensor: STOPPED"
+            fi
+            ;;
+        --logs)
+            if [ "$2" == "--server" ]; then
+                tail -f "$MALTRAIL_DIR/server.log"
+            elif [ "$2" == "--sensor" ]; then
+                tail -f "$MALTRAIL_DIR/sensor.log"
+            else
+                log "Invalid log option. Use --server or --sensor"
+                return 1
+            fi
+            ;;
+        --update)
+            if [ -d "/opt/maltrail" ]; then
+                cd /opt/maltrail
+                git pull
+                log "Maltrail updated from GitHub"
+            else
+                log "Maltrail not found in /opt/maltrail"
+                return 1
+            fi
+            ;;
+        *)
+            log "Invalid Maltrail action"
+            return 1
+            ;;
+    esac
+}
+
+manage_fail2ban() {
+    case $1 in
+        --start)
+            if ! command -v fail2ban-server >/dev/null; then
+                log "Fail2Ban not installed. Install with: apt install fail2ban"
+                return 1
+            fi
+            
+            if systemctl is-active --quiet fail2ban; then
+                log "Fail2Ban is already running"
+                return 0
+            fi
+            
+            systemctl start fail2ban
+            if [ $? -eq 0 ]; then
+                log "Fail2Ban started successfully"
+            else
+                log "Failed to start Fail2Ban"
+                return 1
+            fi
+            ;;
+        --stop)
+            systemctl stop fail2ban
+            log "Fail2Ban stopped"
+            ;;
+        --status)
+            fail2ban-client status
+            ;;
+        --ban-list)
+            fail2ban-client status | grep -A 50 "Jail list" | grep -v "Jail list" | tr ',' '\n' | xargs -I {} fail2ban-client status {}
+            ;;
+        --unban)
+            if [ -z "$2" ]; then
+                log "IP address required for unban"
+                return 1
+            fi
+            
+            local jails=$(fail2ban-client status | grep "Jail list" | sed 's/.*Jail list:\s*//; s/,//g')
+            for jail in $jails; do
+                fail2ban-client set $jail unbanip "$2"
+                log "Unbanned $2 from $jail"
+            done
+            ;;
+        --add-jail)
+            if [ -z "$2" ] || [ -z "$3" ]; then
+                log "Jail name and service required (e.g., ssh or apache)"
+                return 1
+            fi
+            
+            local jail_name=$2
+            local service=$3
+            local port=${4:-$(grep -w "$service" /etc/services | awk '{print $2}' | cut -d'/' -f1)}
+            
+            if [ -z "$port" ]; then
+                log "Could not determine port for service $service"
+                return 1
+            fi
+            
+            # Create jail configuration
+            cat > /etc/fail2ban/jail.d/${jail_name}.local << EOF
+[${jail_name}]
+enabled = true
+port = $port
+filter = $jail_name
+logpath = /var/log/$service.log
+maxretry = 3
+bantime = 3600
+EOF
+            
+            # Restart fail2ban to apply changes
+            systemctl restart fail2ban
+            log "Added jail for $service (port $port)"
+            ;;
+        *)
+            log "Invalid Fail2Ban action"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Monitoring Functions (Netdata)
+# =============================================
+
+manage_netdata() {
+    case $1 in
+        --install)
+            if command -v netdata >/dev/null; then
+                log "Netdata is already installed"
+                return 0
+            fi
+            
+            # Install Netdata
+            bash <(curl -Ss https://my-netdata.io/kickstart.sh) --non-interactive
+            if [ $? -eq 0 ]; then
+                log "Netdata installed successfully"
+            else
+                log "Failed to install Netdata"
+                return 1
+            fi
+            ;;
+        --start)
+            if ! command -v netdata >/dev/null; then
+                log "Netdata not installed. Use --install first"
+                return 1
+            fi
+            
+            if systemctl is-active --quiet netdata; then
+                log "Netdata is already running"
+                return 0
+            fi
+            
+            systemctl start netdata
+            if [ $? -eq 0 ]; then
+                log "Netdata started successfully"
+            else
+                log "Failed to start Netdata"
+                return 1
+            fi
+            ;;
+        --stop)
+            systemctl stop netdata
+            log "Netdata stopped"
+            ;;
+        --status)
+            if systemctl is-active --quiet netdata; then
+                echo "Netdata: RUNNING (http://localhost:19999)"
+            else
+                echo "Netdata: STOPPED"
+            fi
+            ;;
+        --enable-cloud)
+            if ! command -v netdata >/dev/null; then
+                log "Netdata not installed"
+                return 1
+            fi
+            
+            # Enable Netdata Cloud
+            netdata-claim.sh -token=${2} -rooms=${3} -url=https://app.netdata.cloud
+            if [ $? -eq 0 ]; then
+                log "Netdata Cloud enabled successfully"
+            else
+                log "Failed to enable Netdata Cloud"
+                return 1
+            fi
+            ;;
+        *)
+            log "Invalid Netdata action"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Firewall Functions
+# =============================================
+
+manage_firewall() {
+    # Check if UFW is installed
+    if ! command -v ufw >/dev/null; then
+        log "UFW not installed. Install with: apt install ufw"
+        return 1
+    fi
+    
+    case $1 in
+        --add-rule)
+            if [ "$2" == "--port" ]; then
+                local port=$3
+                local protocol=$5
+                
+                if [ -z "$port" ] || [ -z "$protocol" ]; then
+                    log "Missing port or protocol for firewall rule"
+                    return 1
+                fi
+                
+                # Validate port number
+                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                    log "Invalid port number: $port"
+                    return 1
+                fi
+                
+                # Validate protocol
+                if ! [[ "$protocol" =~ ^(tcp|udp)$ ]]; then
+                    log "Invalid protocol: $protocol (must be tcp or udp)"
+                    return 1
+                fi
+                
+                ufw allow $port/$protocol
+                log "Added firewall rule for $protocol port $port"
+                
+            elif [ "$2" == "--service" ]; then
+                local service=$3
+                
+                if [ -z "$service" ]; then
+                    log "Missing service name for firewall rule"
+                    return 1
+                fi
+                
+                # Check if service exists in /etc/services
+                if ! grep -q "^$service" /etc/services; then
+                    log "Service not found in /etc/services: $service"
+                    return 1
+                fi
+                
+                ufw allow $service
+                log "Added firewall rule for service $service"
+            else
+                log "Invalid add-rule option"
+                return 1
+            fi
+            ;;
+        --panic-mode)
+            if [ "$2" == "--on" ]; then
+                ufw enable
+                ufw default deny incoming
+                ufw default deny outgoing
+                log "Firewall panic mode activated - all traffic blocked"
+            elif [ "$2" == "--off" ]; then
+                ufw default allow outgoing
+                ufw default deny incoming
+                log "Firewall panic mode deactivated"
+            else
+                log "Invalid panic-mode option"
+                return 1
+            fi
+            ;;
+        *)
+            log "Invalid firewall action"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Service Management
+# =============================================
+
+manage_service() {
+    local service=$1
+    local action=$2
+    
+    if [ -z "$service" ] || [ -z "$action" ]; then
+        log "Service name and action required"
+        return 1
+    fi
+    
+    case $action in
+        --start|--stop|--restart|--status)
+            local cmd=$(echo "$action" | sed 's/^--//')
+            systemctl $cmd $service
+            log "Service $service $cmd attempted"
+            ;;
+        *)
+            log "Invalid service action: $action"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================
+# Main Help Function
+# =============================================
+
+show_help() {
+    cat << EOF
+myfw v$VERSION - Next-Generation Firewall for Linux
+
+Usage: ./myfw [CATEGORY] [ACTION] [OPTIONS]
+
+Firewall:
+  --firewall rule --add-port PORT --proto PROTO  Add port-based rule
+  --firewall rule --add-service SERVICE          Add service-based rule
+  --firewall panic --enable/--disable            Enable/disable panic mode
+
+Intrusion Detection/Prevention:
+  --ids suricata --start                        Start Suricata IDS
+  --ids suricata --active-log                   Show Suricata active log
+  --ids suricata --update                       Update Suricata rules
+  --ids suricata --ips-mode                     Configure Suricata in IPS mode
+  --ids suricata --add-rule "RULE"              Add custom rule to Suricata
+  --ids maltrail --start/--stop/--status        Manage Maltrail
+  --ids maltrail --logs --server/--sensor       View Maltrail logs
+  --ids maltrail --update                       Update Maltrail
+  --ips fail2ban --start/--stop/--status        Manage Fail2Ban
+  --ips fail2ban --ban-list                     Show banned IPs
+  --ips fail2ban --unban IP                     Unban an IP
+  --ips fail2ban --add-jail NAME SERVICE [PORT] Add new Fail2Ban jail
+
+Monitoring:
+  --monitor netdata --install                   Install Netdata
+  --monitor netdata --start/--stop/--status     Manage Netdata
+  --monitor netdata --enable-cloud TOKEN ROOMS  Enable Netdata Cloud
+
+Service Management:
+  --service NAME --start/--stop/--restart/--status  Manage system services
+
+Examples:
+  ./myfw --firewall rule --add-port 22 --proto tcp
+  ./myfw --firewall panic --enable
+  ./myfw --ids suricata --start
+  ./myfw --ids suricata --add-rule 'alert tcp any any -> any any (msg:"Test Rule"; sid:1000001;)'
+  ./myfw --ids maltrail --start
+  ./myfw --ips fail2ban --add-jail ssh sshd
+  ./myfw --ips fail2ban --ban-list
+  ./myfw --monitor netdata --install
+  ./myfw --service suricata --restart
+EOF
+}
+
+# =============================================
+# Main Execution
+# =============================================
+
+acquire_lock
+
+case $1 in
+    --help)
+        show_help
+        ;;
+        
+    --firewall)
+        case $2 in
+            rule)
+                manage_firewall --add-rule $3 $4 $5 $6
+                ;;
+            panic)
+                manage_firewall --panic-mode $3
+                ;;
+            *)
+                log "Invalid firewall option"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --ids)
+        case $2 in
+            suricata)
+                manage_suricata $3 "$4"
+                ;;
+            maltrail)
+                manage_maltrail $3 "$4" "$5"
+                ;;
+            *)
+                log "Invalid IDS category"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --ips)
+        case $2 in
+            fail2ban)
+                manage_fail2ban $3 "$4" "$5" "$6"
+                ;;
+            *)
+                log "Invalid IPS category"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --monitor)
+        case $2 in
+            netdata)
+                manage_netdata $3 "$4" "$5"
+                ;;
+            *)
+                log "Invalid monitor category"
+                show_help
+                ;;
+        esac
+        ;;
+        
+    --service)
+        if [ $# -ge 3 ]; then
+            manage_service $2 $3
+        else
+            log "Invalid service command"
+            show_help
+        fi
+        ;;
+        
+    *)
+        log "Invalid option: $1"
+        show_help
+        ;;
+esac
+
+release_lock
+exit 0
