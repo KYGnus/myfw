@@ -428,8 +428,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: ${MAINTAINER}
-Depends: bash, nftables, iproute2, procps, util-linux
-Recommends: conntrack, suricata, suricata-update, fail2ban
+Depends: bash, nftables, iproute2, procps, util-linux , conntrack, suricata, suricata-update, fail2ban
 Suggests: maltrail, netdata
 Description: ${DESCRIPTION}
  KYGnus myfw provides a Bash-based enterprise firewall management
