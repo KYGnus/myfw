@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+
+set -e
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+APP_NAME="myfw"
+DEFAULT_VERSION="3.0.0"
+MAINTAINER="KYGnus <kygnus.co@proton.me>"
+DESCRIPTION="KYGnus Enterprise Linux Firewall and Security Framework"
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SOURCE_SCRIPT="${SCRIPT_DIR}/myfw"
+
+VERSION="${DEFAULT_VERSION}"
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
+BUILD_ROOT="${SCRIPT_DIR}/build"
+PKG_ROOT="${BUILD_ROOT}/${APP_NAME}"
+DEBIAN_DIR="${PKG_ROOT}/DEBIAN"
+
+OUTPUT_DIR="${SCRIPT_DIR}/dist"
+
+PACKAGE_NAME="${APP_NAME}_${VERSION}_${ARCH}.deb"
+
+###############################################################################
+# COLORS
+###############################################################################
+
+if [ -t 1 ]; then
+    RED="\033[31m"
+    GREEN="\033[32m"
+    YELLOW="\033[33m"
+    BLUE="\033[34m"
+    CYAN="\033[36m"
+    RESET="\033[0m"
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    CYAN=""
+    RESET=""
+fi
+
+###############################################################################
+# LOGGING
+###############################################################################
+
+info() {
+    echo -e "${GREEN}[INFO]${RESET} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${RESET} $*"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+###############################################################################
+# ARGUMENTS
+###############################################################################
+
+CLEAN_ONLY="no"
+INSTALL_BUILD_DEPS="yes"
+
+while [ $# -gt 0 ]; do
+
+    case "$1" in
+
+        --version)
+            [ -n "${2:-}" ] || die "--version requires a value"
+            VERSION="$2"
+            shift 2
+            ;;
+
+        --clean)
+            CLEAN_ONLY="yes"
+            shift
+            ;;
+
+        --no-build-deps)
+            INSTALL_BUILD_DEPS="no"
+            shift
+            ;;
+
+        --help|-h)
+            cat <<EOF
+
+KYGnus myfw Debian Package Builder
+
+Usage:
+
+    ./build-deb
+    ./build-deb --version 2.0.1
+    ./build-deb --clean
+    ./build-deb --no-build-deps
+
+Output:
+
+    dist/myfw_${VERSION}_${ARCH}.deb
+
+EOF
+            exit 0
+            ;;
+
+        *)
+            die "Unknown option: $1"
+            ;;
+
+    esac
+
+done
+
+###############################################################################
+# CLEAN
+###############################################################################
+
+if [ "$CLEAN_ONLY" = "yes" ]; then
+
+    info "Cleaning build directories..."
+
+    rm -rf "$BUILD_ROOT"
+    rm -rf "$OUTPUT_DIR"
+
+    info "Clean completed."
+
+    exit 0
+fi
+
+###############################################################################
+# ROOT CHECK
+###############################################################################
+
+if [ "$(id -u)" -eq 0 ]; then
+    die "Do not run the package builder as root."
+fi
+
+###############################################################################
+# HOST CHECK
+###############################################################################
+
+if [ ! -f /etc/debian_version ]; then
+    die "This builder requires a Debian-based build system."
+fi
+
+###############################################################################
+# SOURCE CHECK
+###############################################################################
+
+if [ ! -f "$SOURCE_SCRIPT" ]; then
+    die "myfw script not found:
+
+$SOURCE_SCRIPT
+
+Place build-deb in the same directory as:
+
+    myfw
+"
+fi
+
+###############################################################################
+# DEPENDENCY CHECK
+###############################################################################
+
+check_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+install_build_dependencies() {
+
+    if [ "$INSTALL_BUILD_DEPS" = "no" ]; then
+        return 0
+    fi
+
+    local missing=""
+
+    check_command dpkg-deb || missing="$missing dpkg"
+    check_command dpkg-query || missing="$missing dpkg-query"
+
+    if [ -n "$missing" ]; then
+
+        warn "Missing build tools:$missing"
+
+        if check_command sudo; then
+
+            info "Installing Debian packaging tools..."
+
+            sudo apt-get update
+
+            sudo apt-get install -y \
+                dpkg \
+                debhelper \
+                fakeroot
+
+        else
+            die "sudo is required to install build dependencies."
+        fi
+
+    fi
+}
+
+install_build_dependencies
+
+###############################################################################
+# VALIDATE VERSION
+###############################################################################
+
+if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*([+~-][A-Za-z0-9.+~-]+)?$'; then
+    die "Invalid Debian package version: $VERSION"
+fi
+
+###############################################################################
+# VALIDATE SCRIPT
+###############################################################################
+
+info "Checking myfw..."
+
+if ! head -n 1 "$SOURCE_SCRIPT" | grep -q 'bash'; then
+    warn "myfw does not appear to use /usr/bin/env bash."
+fi
+
+if ! grep -q 'VERSION=' "$SOURCE_SCRIPT"; then
+    warn "Could not detect VERSION variable in myfw."
+fi
+
+###############################################################################
+# CHECK SHELL SYNTAX
+###############################################################################
+
+info "Checking Bash syntax..."
+
+if ! bash -n "$SOURCE_SCRIPT"; then
+    die "Bash syntax validation failed."
+fi
+
+info "Bash syntax OK."
+
+###############################################################################
+# PREPARE BUILD TREE
+###############################################################################
+
+info "Preparing package tree..."
+
+rm -rf "$BUILD_ROOT"
+mkdir -p "$DEBIAN_DIR"
+mkdir -p "$OUTPUT_DIR"
+
+###############################################################################
+# INSTALL DIRECTORIES
+###############################################################################
+
+mkdir -p \
+    "${PKG_ROOT}/usr/bin" \
+    "${PKG_ROOT}/etc/myfw/rules" \
+    "${PKG_ROOT}/etc/myfw/sets" \
+    "${PKG_ROOT}/etc/myfw/backups" \
+    "${PKG_ROOT}/var/lib/myfw" \
+    "${PKG_ROOT}/var/lib/myfw/state" \
+    "${PKG_ROOT}/var/lib/myfw/feeds" \
+    "${PKG_ROOT}/var/log/myfw" \
+    "${PKG_ROOT}/run/myfw"
+
+###############################################################################
+# INSTALL MAIN SCRIPT
+###############################################################################
+
+info "Installing myfw..."
+
+install -m 0755 \
+    "$SOURCE_SCRIPT" \
+    "${PKG_ROOT}/usr/bin/myfw"
+
+###############################################################################
+# DEFAULT CONFIGURATION
+###############################################################################
+
+cat > "${PKG_ROOT}/etc/myfw/myfw.conf" <<'EOF'
+# KYGnus myfw configuration
+#
+# This file is managed by the administrator.
+
+MYFW_ENABLE_IPV6="yes"
+
+INPUT_POLICY="drop"
+FORWARD_POLICY="drop"
+OUTPUT_POLICY="accept"
+
+ENABLE_LOGGING="yes"
+LOG_PREFIX="MYFW"
+
+SSH_PORT="22"
+
+# Management network.
+#
+# Example:
+# MANAGEMENT_NETWORK="192.168.1.0/24"
+
+MANAGEMENT_NETWORK=""
+
+# WAN interface.
+#
+# Leave empty for automatic detection.
+
+WAN_INTERFACE=""
+
+# LAN interface.
+
+LAN_INTERFACE=""
+
+# Suricata NFQUEUE number.
+
+SURICATA_QUEUE="0"
+
+# Panic rollback.
+#
+# 0 = disabled
+
+PANIC_ROLLBACK="0"
+EOF
+
+chmod 0640 "${PKG_ROOT}/etc/myfw/myfw.conf"
+
+###############################################################################
+# README
+###############################################################################
+
+mkdir -p "${PKG_ROOT}/usr/share/doc/myfw"
+
+cat > "${PKG_ROOT}/usr/share/doc/myfw/README.Debian" <<'EOF'
+KYGnus myfw
+===========
+
+Enterprise Linux firewall and security framework.
+
+Firewall engine:
+    nftables
+
+Security integrations:
+    Suricata
+    Fail2Ban
+    conntrack
+
+Main command:
+
+    myfw help
+
+Examples:
+
+    myfw status
+
+    myfw policy validate
+
+    myfw policy apply
+
+    myfw rule allow --port 22 --proto tcp
+
+    myfw rule allow --port 443 --proto tcp
+
+    myfw block add 203.0.113.10
+
+    myfw block add 203.0.113.10 --timeout 1h
+
+    myfw block list
+
+    myfw nat masquerade 192.168.1.0/24 eth0
+
+    myfw ids suricata start
+
+    myfw ids suricata status
+
+    myfw ips fail2ban status
+
+Configuration:
+
+    /etc/myfw/myfw.conf
+
+Logs:
+
+    /var/log/myfw/
+
+State:
+
+    /var/lib/myfw/
+
+Backups:
+
+    /etc/myfw/backups/
+EOF
+
+chmod 0644 "${PKG_ROOT}/usr/share/doc/myfw/README.Debian"
+
+###############################################################################
+# LICENSE / COPYRIGHT
+###############################################################################
+
+cat > "${PKG_ROOT}/usr/share/doc/myfw/copyright" <<EOF
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: *
+Copyright: $(date +%Y) KYGnus
+License: Proprietary
+
+KYGnus myfw
+EOF
+
+chmod 0644 "${PKG_ROOT}/usr/share/doc/myfw/copyright"
+
+###############################################################################
+# DEBIAN CONTROL
+###############################################################################
+
+info "Creating Debian control file..."
+
+cat > "${DEBIAN_DIR}/control" <<EOF
+Package: ${APP_NAME}
+Version: ${VERSION}
+Section: net
+Priority: optional
+Architecture: ${ARCH}
+Maintainer: ${MAINTAINER}
+Depends: bash, nftables, iproute2, procps, util-linux
+Recommends: conntrack, suricata, suricata-update, fail2ban
+Suggests: maltrail, netdata
+Description: ${DESCRIPTION}
+ KYGnus myfw provides a Bash-based enterprise firewall management
+ framework for Linux using nftables as the kernel packet filtering
+ and NAT engine.
+ .
+ Features include stateful filtering, IPv4/IPv6 firewalling, dynamic
+ blocklists, NAT, DNAT, rate limiting, panic mode, firewall backups,
+ Suricata IDS/IPS integration, Fail2Ban integration and audit logging.
+EOF
+
+###############################################################################
+# DEBIAN CONFFILES
+###############################################################################
+
+cat > "${DEBIAN_DIR}/conffiles" <<'EOF'
+/etc/myfw/myfw.conf
+EOF
+
+###############################################################################
+# POSTINST
+###############################################################################
+
+cat > "${DEBIAN_DIR}/postinst" <<'EOF'
+#!/bin/sh
+
+set -e
+
+CONFIG_DIR="/etc/myfw"
+STATE_DIR="/var/lib/myfw"
+LOG_DIR="/var/log/myfw"
+RUN_DIR="/run/myfw"
+
+mkdir -p \
+    "$CONFIG_DIR" \
+    "$CONFIG_DIR/rules" \
+    "$CONFIG_DIR/sets" \
+    "$CONFIG_DIR/backups" \
+    "$STATE_DIR" \
+    "$STATE_DIR/state" \
+    "$STATE_DIR/feeds" \
+    "$LOG_DIR" \
+    "$RUN_DIR"
+
+chmod 750 "$CONFIG_DIR"
+chmod 750 "$STATE_DIR"
+chmod 750 "$LOG_DIR"
+
+if command -v nft >/dev/null 2>&1; then
+    echo
+    echo "KYGnus myfw installed."
+    echo
+    echo "Firewall engine: nftables"
+    echo
+    echo "IMPORTANT:"
+    echo "The firewall is NOT automatically enabled."
+    echo
+    echo "Review:"
+    echo "    /etc/myfw/myfw.conf"
+    echo
+    echo "Then validate:"
+    echo "    sudo myfw policy validate"
+    echo
+    echo "Apply:"
+    echo "    sudo myfw policy apply"
+    echo
+fi
+
+exit 0
+EOF
+
+chmod 0755 "${DEBIAN_DIR}/postinst"
+
+###############################################################################
+# PRERM
+###############################################################################
+
+cat > "${DEBIAN_DIR}/prerm" <<'EOF'
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        echo "KYGnus myfw package removal requested."
+        ;;
+esac
+
+exit 0
+EOF
+
+chmod 0755 "${DEBIAN_DIR}/prerm"
+
+###############################################################################
+# POSTRM
+###############################################################################
+
+cat > "${DEBIAN_DIR}/postrm" <<'EOF'
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/myfw
+        rm -rf /var/log/myfw
+        rm -rf /run/myfw
+        ;;
+esac
+
+exit 0
+EOF
+
+chmod 0755 "${DEBIAN_DIR}/postrm"
+
+###############################################################################
+# LINTIAN OVERRIDES
+###############################################################################
+
+mkdir -p "${PKG_ROOT}/usr/share/lintian/overrides"
+
+cat > "${PKG_ROOT}/usr/share/lintian/overrides/myfw" <<'EOF'
+# myfw is intentionally implemented as a Bash CLI application.
+EOF
+
+###############################################################################
+# PERMISSIONS
+###############################################################################
+
+find "$PKG_ROOT/etc" \
+    -type d \
+    -exec chmod 0755 {} \;
+
+find "$PKG_ROOT/usr/share/doc" \
+    -type d \
+    -exec chmod 0755 {} \;
+
+###############################################################################
+# BUILD
+###############################################################################
+
+info "Building Debian package..."
+
+dpkg-deb \
+    --build \
+    --root-owner-group \
+    "$PKG_ROOT" \
+    "${OUTPUT_DIR}/${PACKAGE_NAME}"
+
+###############################################################################
+# PACKAGE INFORMATION
+###############################################################################
+
+PACKAGE_FILE="${OUTPUT_DIR}/${PACKAGE_NAME}"
+
+[ -f "$PACKAGE_FILE" ] ||
+    die "Package was not created."
+
+echo
+echo "============================================================"
+echo -e "${GREEN} BUILD SUCCESSFUL${RESET}"
+echo "============================================================"
+echo
+echo "Package:"
+echo "  ${PACKAGE_FILE}"
+echo
+echo "Size:"
+du -h "$PACKAGE_FILE" | awk '{print "  "$1}'
+echo
+echo "Architecture:"
+dpkg-deb -f "$PACKAGE_FILE" Architecture
+echo
+echo "Version:"
+dpkg-deb -f "$PACKAGE_FILE" Version
+echo
+echo "Dependencies:"
+dpkg-deb -f "$PACKAGE_FILE" Depends
+echo
+echo "Recommended:"
+dpkg-deb -f "$PACKAGE_FILE" Recommends
+echo
+echo "Install:"
+echo
+echo "  sudo apt install ./${PACKAGE_FILE#"$SCRIPT_DIR"/}"
+echo
+echo "Or:"
+echo
+echo "  sudo dpkg -i \"$PACKAGE_FILE\""
+echo "  sudo apt-get -f install"
+echo
+echo "Test:"
+echo
+echo "  sudo myfw info"
+echo "  sudo myfw policy validate"
+echo "  sudo myfw status"
+echo
+echo "============================================================"
