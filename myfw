@@ -1,639 +1,1909 @@
-#!/bin/bash
+#!/usr/bin/env bash
+###############################################################################
+# KYGnus myfw - Enterprise Linux Firewall & Security Framework
 
-# myfw - Next-Generation Firewall for Linux Systems
 
-VERSION="1.0.0"
+set -o pipefail
+
+VERSION="2.0.0"
+APP_NAME="myfw"
+
 CONFIG_DIR="/etc/myfw"
+RULES_DIR="${CONFIG_DIR}/rules"
+SETS_DIR="${CONFIG_DIR}/sets"
+BACKUP_DIR="${CONFIG_DIR}/backups"
+STATE_DIR="/var/lib/myfw"
 LOG_DIR="/var/log/myfw"
-SURICATA_RULES_DIR="/etc/suricata/rules"
-MALTRAIL_DIR="/var/log/maltrail"
+RUN_DIR="/run/myfw"
+
+MAIN_CONFIG="${CONFIG_DIR}/myfw.conf"
+NFT_RULESET="${RULES_DIR}/myfw.nft"
+NFT_STATE="${STATE_DIR}/ruleset.nft"
 LOCK_FILE="/var/lock/myfw.lock"
 
-# Ensure script is run as root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root" >&2
-    exit 1
+NFT_FAMILY="inet"
+NFT_TABLE="myfw"
+
+BLACKLIST_SET="blacklist"
+WHITELIST_SET="whitelist"
+
+SURICATA_CONFIG="/etc/suricata/suricata.yaml"
+SURICATA_LOG_DIR="/var/log/suricata"
+
+FAIL2BAN_CONFIG="/etc/fail2ban"
+MALTRAIL_DIR="/var/lib/myfw/maltrail"
+
+DEFAULT_SSH_PORT="22"
+
+###############################################################################
+# COLORS
+###############################################################################
+
+if [ -t 1 ]; then
+    RED="\033[31m"
+    GREEN="\033[32m"
+    YELLOW="\033[33m"
+    BLUE="\033[34m"
+    CYAN="\033[36m"
+    RESET="\033[0m"
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    CYAN=""
+    RESET=""
 fi
 
-# Create necessary directories
-mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$SURICATA_RULES_DIR" "$MALTRAIL_DIR"
+###############################################################################
+# BASIC FUNCTIONS
+###############################################################################
 
-# Initialize logging
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/myfw.log"
+die() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+    exit 1
 }
 
-# Acquire lock to prevent multiple instances
+info() {
+    echo -e "${GREEN}[INFO]${RESET} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${RESET} $*" >&2
+}
+
+error() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+}
+
+audit() {
+    mkdir -p "$LOG_DIR"
+
+    printf '[%s] USER=%s PID=%s ACTION=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S%z')" \
+        "${SUDO_USER:-${USER:-root}}" \
+        "$$" \
+        "$*" >> "${LOG_DIR}/audit.log"
+}
+
+log() {
+    mkdir -p "$LOG_DIR"
+
+    printf '[%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*" >> "${LOG_DIR}/myfw.log"
+
+    echo "[myfw] $*"
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        die "This command must be run as root."
+    fi
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+    command_exists "$1" || die "Required command not found: $1"
+}
+
+###############################################################################
+# DIRECTORIES
+###############################################################################
+
+init_directories() {
+    mkdir -p \
+        "$CONFIG_DIR" \
+        "$RULES_DIR" \
+        "$SETS_DIR" \
+        "$BACKUP_DIR" \
+        "$STATE_DIR" \
+        "$LOG_DIR" \
+        "$RUN_DIR"
+
+    chmod 750 "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
+}
+
+###############################################################################
+# LOCK
+###############################################################################
+
 acquire_lock() {
-    exec 200>$LOCK_FILE
-    flock -n 200 || {
-        log "Another instance is already running. Exiting."
-        exit 1
-    }
-    echo $$ >&200
+    mkdir -p "$(dirname "$LOCK_FILE")"
+
+    exec 200>"$LOCK_FILE"
+
+    if ! flock -n 200; then
+        die "Another myfw process is currently running."
+    fi
+
+    echo "$$" >&200
 }
 
 release_lock() {
-    flock -u 200
-    rm -f $LOCK_FILE
+    flock -u 200 2>/dev/null || true
 }
 
-# Email notification function
-send_alert() {
-    local subject=$1
-    local message=$2
-    if [ -f "$CONFIG_DIR/email.conf" ]; then
-        source "$CONFIG_DIR/email.conf"
-        echo "$message" | mail -s "$subject" "$ALERT_EMAIL"
-    else
-        log "Email alert not configured. Create $CONFIG_DIR/email.conf with ALERT_EMAIL variable."
+###############################################################################
+# SIGNAL HANDLING
+###############################################################################
+
+cleanup() {
+    release_lock
+}
+
+trap cleanup EXIT
+trap 'die "Interrupted."' INT TERM
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+create_default_config() {
+
+    if [ -f "$MAIN_CONFIG" ]; then
+        return 0
     fi
-}
 
-# =============================================
-# IDS/IPS Functions
-# =============================================
+    cat > "$MAIN_CONFIG" <<EOF
+# KYGnus myfw configuration
+#
+# Main firewall policy
 
-manage_suricata() {
-    case $1 in
-        --start)
-            if ! command -v suricata >/dev/null; then
-                log "Suricata not installed. Install with: apt install suricata"
-                return 1
-            fi
-            
-            local interface=$(ip -o -4 route show to default | awk '{print $5}')
-            if [ -z "$interface" ]; then
-                log "Could not determine network interface"
-                return 1
-            fi
-            
-            # Check if Suricata is already running
-            if pgrep -x "suricata" >/dev/null; then
-                log "Suricata is already running"
-                return 0
-            fi
-            
-            # Start Suricata
-            suricata -c /etc/suricata/suricata.yaml -i $interface -D
-            if [ $? -eq 0 ]; then
-                log "Suricata started on interface $interface"
-            else
-                log "Failed to start Suricata"
-                return 1
-            fi
-            ;;
-        --active-log)
-            if [ ! -f "/var/log/suricata/fast.log" ]; then
-                log "Suricata log file not found. Is Suricata running?"
-                return 1
-            fi
-            tail -f /var/log/suricata/fast.log
-            ;;
-        --update)
-            if ! command -v suricata-update >/dev/null; then
-                log "suricata-update not found. Install Suricata first."
-                return 1
-            fi
-            
-            suricata-update
-            if [ $? -eq 0 ]; then
-                log "Suricata rules updated"
-                
-                # Reload Suricata if running
-                if pgrep -x "suricata" >/dev/null; then
-                    kill -USR2 $(pidof suricata)
-                    log "Suricata rules reloaded"
-                fi
-            else
-                log "Failed to update Suricata rules"
-                return 1
-            fi
-            ;;
-        --ips-mode)
-            # Enable IPS mode by enabling NFQUEUE
-            if ! grep -q "nfqueue" /etc/suricata/suricata.yaml; then
-                sed -i '/^ *- detect-protocols:/a \    - af-packet\n    - nfqueue' /etc/suricata/suricata.yaml
-                log "NFQUEUE enabled in Suricata configuration"
-                
-                # Restart Suricata if running
-                if pgrep -x "suricata" >/dev/null; then
-                    pkill -9 suricata
-                    manage_suricata --start
-                fi
-                
-                # Configure iptables to send traffic to NFQUEUE
-                iptables -I INPUT -j NFQUEUE --queue-bypass
-                iptables -I OUTPUT -j NFQUEUE --queue-bypass
-                iptables -I FORWARD -j NFQUEUE --queue-bypass
-                log "IPTables configured for IPS mode"
-            else
-                log "Suricata already configured for IPS mode"
-            fi
-            ;;
-        --add-rule)
-            if [ -z "$2" ]; then
-                log "No rule provided"
-                return 1
-            fi
-            
-            # Validate rule syntax
-            if ! echo "$2" | grep -qE '^alert\s+'; then
-                log "Invalid Suricata rule format. Must start with 'alert'"
-                return 1
-            fi
-            
-            # Add rule to local rules file
-            echo "$2" >> "$SURICATA_RULES_DIR/local.rules"
-            
-            # Reload rules if Suricata is running
-            if pgrep -x "suricata" >/dev/null; then
-                kill -USR2 $(pidof suricata)
-                log "Added rule to Suricata and reloaded rules: $2"
-            else
-                log "Added rule to Suricata (service not running): $2"
-            fi
-            ;;
-        *)
-            log "Invalid Suricata action"
-            return 1
-            ;;
-    esac
-}
+MYFW_ENABLE_IPV6="yes"
 
-manage_maltrail() {
-    case $1 in
-        --start)
-            if ! command -v maltrail-server >/dev/null; then
-                log "Maltrail not installed. Clone from https://github.com/stamparm/maltrail"
-                return 1
-            fi
-            
-            if pgrep -f "maltrail-server" >/dev/null; then
-                log "Maltrail server is already running"
-                return 0
-            fi
-            
-            # Start maltrail server
-            maltrail-server > "$MALTRAIL_DIR/server.log" 2>&1 &
-            sleep 2
-            
-            if pgrep -f "maltrail-server" >/dev/null; then
-                log "Maltrail server started"
-            else
-                log "Failed to start Maltrail server"
-                return 1
-            fi
-            
-            # Start maltrail sensor
-            if pgrep -f "maltrail-sensor" >/dev/null; then
-                log "Maltrail sensor is already running"
-                return 0
-            fi
-            
-            maltrail-sensor > "$MALTRAIL_DIR/sensor.log" 2>&1 &
-            sleep 2
-            
-            if pgrep -f "maltrail-sensor" >/dev/null; then
-                log "Maltrail sensor started"
-            else
-                log "Failed to start Maltrail sensor"
-                return 1
-            fi
-            ;;
-        --stop)
-            pkill -f "maltrail-server"
-            pkill -f "maltrail-sensor"
-            log "Maltrail server and sensor stopped"
-            ;;
-        --status)
-            if pgrep -f "maltrail-server" >/dev/null; then
-                echo "Maltrail server: RUNNING"
-            else
-                echo "Maltrail server: STOPPED"
-            fi
-            
-            if pgrep -f "maltrail-sensor" >/dev/null; then
-                echo "Maltrail sensor: RUNNING"
-            else
-                echo "Maltrail sensor: STOPPED"
-            fi
-            ;;
-        --logs)
-            if [ "$2" == "--server" ]; then
-                tail -f "$MALTRAIL_DIR/server.log"
-            elif [ "$2" == "--sensor" ]; then
-                tail -f "$MALTRAIL_DIR/sensor.log"
-            else
-                log "Invalid log option. Use --server or --sensor"
-                return 1
-            fi
-            ;;
-        --update)
-            if [ -d "/opt/maltrail" ]; then
-                cd /opt/maltrail
-                git pull
-                log "Maltrail updated from GitHub"
-            else
-                log "Maltrail not found in /opt/maltrail"
-                return 1
-            fi
-            ;;
-        *)
-            log "Invalid Maltrail action"
-            return 1
-            ;;
-    esac
-}
+INPUT_POLICY="drop"
+FORWARD_POLICY="drop"
+OUTPUT_POLICY="accept"
 
-manage_fail2ban() {
-    case $1 in
-        --start)
-            if ! command -v fail2ban-server >/dev/null; then
-                log "Fail2Ban not installed. Install with: apt install fail2ban"
-                return 1
-            fi
-            
-            if systemctl is-active --quiet fail2ban; then
-                log "Fail2Ban is already running"
-                return 0
-            fi
-            
-            systemctl start fail2ban
-            if [ $? -eq 0 ]; then
-                log "Fail2Ban started successfully"
-            else
-                log "Failed to start Fail2Ban"
-                return 1
-            fi
-            ;;
-        --stop)
-            systemctl stop fail2ban
-            log "Fail2Ban stopped"
-            ;;
-        --status)
-            fail2ban-client status
-            ;;
-        --ban-list)
-            fail2ban-client status | grep -A 50 "Jail list" | grep -v "Jail list" | tr ',' '\n' | xargs -I {} fail2ban-client status {}
-            ;;
-        --unban)
-            if [ -z "$2" ]; then
-                log "IP address required for unban"
-                return 1
-            fi
-            
-            local jails=$(fail2ban-client status | grep "Jail list" | sed 's/.*Jail list:\s*//; s/,//g')
-            for jail in $jails; do
-                fail2ban-client set $jail unbanip "$2"
-                log "Unbanned $2 from $jail"
-            done
-            ;;
-        --add-jail)
-            if [ -z "$2" ] || [ -z "$3" ]; then
-                log "Jail name and service required (e.g., ssh or apache)"
-                return 1
-            fi
-            
-            local jail_name=$2
-            local service=$3
-            local port=${4:-$(grep -w "$service" /etc/services | awk '{print $2}' | cut -d'/' -f1)}
-            
-            if [ -z "$port" ]; then
-                log "Could not determine port for service $service"
-                return 1
-            fi
-            
-            # Create jail configuration
-            cat > /etc/fail2ban/jail.d/${jail_name}.local << EOF
-[${jail_name}]
-enabled = true
-port = $port
-filter = $jail_name
-logpath = /var/log/$service.log
-maxretry = 3
-bantime = 3600
+ENABLE_LOGGING="yes"
+LOG_PREFIX="MYFW"
+
+SSH_PORT="${DEFAULT_SSH_PORT}"
+
+# Management network.
+# Example:
+# MANAGEMENT_NETWORK="192.168.1.0/24"
+
+MANAGEMENT_NETWORK=""
+
+# Default WAN interface.
+# Leave empty for automatic detection.
+
+WAN_INTERFACE=""
+
+# Default LAN interface.
+
+LAN_INTERFACE=""
+
+# Suricata NFQUEUE
+
+SURICATA_QUEUE="0"
+
+# Panic rollback in seconds.
+# 0 = no automatic rollback.
+
+PANIC_ROLLBACK="0"
 EOF
-            
-            # Restart fail2ban to apply changes
-            systemctl restart fail2ban
-            log "Added jail for $service (port $port)"
+}
+
+load_config() {
+    create_default_config
+
+    # shellcheck disable=SC1090
+    source "$MAIN_CONFIG"
+}
+
+###############################################################################
+# NETWORK DETECTION
+###############################################################################
+
+get_default_interface() {
+    ip route show default 2>/dev/null |
+        awk 'NR==1 {print $5}'
+}
+
+get_default_gateway() {
+    ip route show default 2>/dev/null |
+        awk 'NR==1 {print $3}'
+}
+
+###############################################################################
+# IP VALIDATION
+###############################################################################
+
+valid_ipv4() {
+    local ip="$1"
+    local IFS=.
+
+    read -r a b c d <<< "$ip"
+
+    [[ "$a" =~ ^[0-9]+$ ]] &&
+    [[ "$b" =~ ^[0-9]+$ ]] &&
+    [[ "$c" =~ ^[0-9]+$ ]] &&
+    [[ "$d" =~ ^[0-9]+$ ]] &&
+    [ "$a" -le 255 ] &&
+    [ "$b" -le 255 ] &&
+    [ "$c" -le 255 ] &&
+    [ "$d" -le 255 ]
+}
+
+valid_ipv4_or_cidr() {
+    local value="$1"
+
+    if [[ "$value" == */* ]]; then
+        local ip="${value%/*}"
+        local prefix="${value#*/}"
+
+        valid_ipv4 "$ip" &&
+        [[ "$prefix" =~ ^[0-9]+$ ]] &&
+        [ "$prefix" -le 32 ]
+    else
+        valid_ipv4 "$value"
+    fi
+}
+
+valid_port() {
+    local port="$1"
+
+    [[ "$port" =~ ^[0-9]+$ ]] &&
+    [ "$port" -ge 1 ] &&
+    [ "$port" -le 65535 ]
+}
+
+valid_protocol() {
+    case "$1" in
+        tcp|udp|icmp|icmpv6|sctp)
+            return 0
             ;;
         *)
-            log "Invalid Fail2Ban action"
             return 1
             ;;
     esac
 }
 
-# =============================================
-# Monitoring Functions (Netdata)
-# =============================================
+###############################################################################
+# NFTABLES BASE
+###############################################################################
 
-manage_netdata() {
-    case $1 in
-        --install)
-            if command -v netdata >/dev/null; then
-                log "Netdata is already installed"
-                return 0
-            fi
-            
-            # Install Netdata
-            bash <(curl -Ss https://my-netdata.io/kickstart.sh) --non-interactive
-            if [ $? -eq 0 ]; then
-                log "Netdata installed successfully"
-            else
-                log "Failed to install Netdata"
-                return 1
-            fi
-            ;;
-        --start)
-            if ! command -v netdata >/dev/null; then
-                log "Netdata not installed. Use --install first"
-                return 1
-            fi
-            
-            if systemctl is-active --quiet netdata; then
-                log "Netdata is already running"
-                return 0
-            fi
-            
-            systemctl start netdata
-            if [ $? -eq 0 ]; then
-                log "Netdata started successfully"
-            else
-                log "Failed to start Netdata"
-                return 1
-            fi
-            ;;
-        --stop)
-            systemctl stop netdata
-            log "Netdata stopped"
-            ;;
-        --status)
-            if systemctl is-active --quiet netdata; then
-                echo "Netdata: RUNNING (http://localhost:19999)"
-            else
-                echo "Netdata: STOPPED"
-            fi
-            ;;
-        --enable-cloud)
-            if ! command -v netdata >/dev/null; then
-                log "Netdata not installed"
-                return 1
-            fi
-            
-            # Enable Netdata Cloud
-            netdata-claim.sh -token=${2} -rooms=${3} -url=https://app.netdata.cloud
-            if [ $? -eq 0 ]; then
-                log "Netdata Cloud enabled successfully"
-            else
-                log "Failed to enable Netdata Cloud"
-                return 1
-            fi
-            ;;
-        *)
-            log "Invalid Netdata action"
-            return 1
-            ;;
-    esac
+nft_exists() {
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1
 }
 
-# =============================================
-# Firewall Functions
-# =============================================
+nft_flush_myfw() {
+    if nft_exists; then
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE"
+    fi
+}
 
-manage_firewall() {
-    # Check if UFW is installed
-    if ! command -v ufw >/dev/null; then
-        log "UFW not installed. Install with: apt install ufw"
+###############################################################################
+# FIREWALL RULESET GENERATION
+###############################################################################
+
+generate_base_ruleset() {
+
+    load_config
+
+    local input_policy="${INPUT_POLICY:-drop}"
+    local forward_policy="${FORWARD_POLICY:-drop}"
+    local output_policy="${OUTPUT_POLICY:-accept}"
+
+    cat > "$NFT_RULESET" <<EOF
+#!/usr/sbin/nft -f
+
+flush table ${NFT_FAMILY} ${NFT_TABLE}
+
+table ${NFT_FAMILY} ${NFT_TABLE} {
+
+    #
+    # Dynamic security sets
+    #
+
+    set ${BLACKLIST_SET} {
+        type ipv4_addr
+        flags interval, timeout
+    }
+
+    set ${WHITELIST_SET} {
+        type ipv4_addr
+        flags interval
+    }
+
+    #
+    # INPUT
+    #
+
+    chain input {
+        type filter hook input priority 0;
+        policy ${input_policy};
+
+        ct state invalid drop
+        ct state established,related accept
+
+        iifname "lo" accept
+
+        ip saddr @blacklist drop
+
+        ip saddr @whitelist accept
+
+        ip protocol icmp accept
+
+        ip6 nexthdr ipv6-icmp accept
+
+EOF
+
+    if [ -n "${MANAGEMENT_NETWORK:-}" ]; then
+
+        if valid_ipv4_or_cidr "$MANAGEMENT_NETWORK"; then
+            cat >> "$NFT_RULESET" <<EOF
+        ip saddr ${MANAGEMENT_NETWORK} tcp dport ${SSH_PORT} accept
+EOF
+        else
+            warn "Invalid MANAGEMENT_NETWORK: $MANAGEMENT_NETWORK"
+        fi
+    fi
+
+    cat >> "$NFT_RULESET" <<EOF
+
+        #
+        # SSH protection
+        #
+
+        tcp dport ${SSH_PORT} ct state new limit rate 20/minute burst 10 packets accept
+
+        #
+        # DNS
+        #
+
+        udp dport 53 accept
+        tcp dport 53 accept
+
+        #
+        # DHCP
+        #
+
+        udp sport 67 udp dport 68 accept
+
+        #
+        # Optional logging
+        #
+
+EOF
+
+    if [ "${ENABLE_LOGGING:-yes}" = "yes" ]; then
+        cat >> "$NFT_RULESET" <<EOF
+        limit rate 10/second burst 20 packets log prefix "${LOG_PREFIX:-MYFW}-INPUT " level warning
+EOF
+    fi
+
+    cat >> "$NFT_RULESET" <<EOF
+    }
+
+    #
+    # FORWARD
+    #
+
+    chain forward {
+        type filter hook forward priority 0;
+        policy ${forward_policy};
+
+        ct state invalid drop
+        ct state established,related accept
+
+        ip saddr @blacklist drop
+
+EOF
+
+    if [ "${ENABLE_LOGGING:-yes}" = "yes" ]; then
+        cat >> "$NFT_RULESET" <<EOF
+        limit rate 10/second burst 20 packets log prefix "${LOG_PREFIX:-MYFW}-FORWARD " level warning
+EOF
+    fi
+
+    cat >> "$NFT_RULESET" <<EOF
+    }
+
+    #
+    # OUTPUT
+    #
+
+    chain output {
+        type filter hook output priority 0;
+        policy ${output_policy};
+
+        ct state invalid drop
+        ct state established,related accept
+
+        ip daddr @blacklist drop
+    }
+}
+EOF
+}
+
+###############################################################################
+# FIREWALL APPLY
+###############################################################################
+
+validate_ruleset() {
+    require_command nft
+
+    [ -f "$NFT_RULESET" ] || die "Ruleset does not exist."
+
+    info "Validating nftables configuration..."
+
+    if nft -c -f "$NFT_RULESET"; then
+        info "Ruleset validation successful."
+        audit "RULESET_VALIDATE RESULT=SUCCESS"
+        return 0
+    fi
+
+    audit "RULESET_VALIDATE RESULT=FAILED"
+    return 1
+}
+
+backup_current_ruleset() {
+    require_command nft
+
+    local timestamp
+    timestamp="$(date '+%Y%m%d-%H%M%S')"
+
+    mkdir -p "$BACKUP_DIR"
+
+    if nft list ruleset > "${BACKUP_DIR}/ruleset-${timestamp}.nft" 2>/dev/null; then
+        info "Firewall backup created:"
+        echo "  ${BACKUP_DIR}/ruleset-${timestamp}.nft"
+    fi
+}
+
+apply_ruleset() {
+    require_command nft
+
+    generate_base_ruleset
+
+    validate_ruleset || die "Firewall ruleset validation failed."
+
+    backup_current_ruleset
+
+    info "Applying firewall configuration..."
+
+    if nft -f "$NFT_RULESET"; then
+
+        nft list table "$NFT_FAMILY" "$NFT_TABLE" \
+            > "$NFT_STATE" 2>/dev/null || true
+
+        audit "RULESET_APPLY RESULT=SUCCESS"
+        info "Firewall successfully applied."
+
+        return 0
+    fi
+
+    audit "RULESET_APPLY RESULT=FAILED"
+    die "Failed to apply firewall configuration."
+}
+
+###############################################################################
+# FIREWALL STATUS
+###############################################################################
+
+firewall_status() {
+
+    require_command nft
+
+    echo
+    echo "============================================================"
+    echo " KYGnus myfw v${VERSION}"
+    echo "============================================================"
+    echo
+
+    if nft_exists; then
+        echo "Firewall        : ACTIVE"
+    else
+        echo "Firewall        : INACTIVE"
+    fi
+
+    echo "Backend         : nftables"
+    echo "Table           : ${NFT_FAMILY} ${NFT_TABLE}"
+    echo "Default IF      : $(get_default_interface)"
+    echo "Gateway         : $(get_default_gateway)"
+
+    echo
+    echo "Policies:"
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null |
+        grep -E 'chain (input|forward|output)|policy' |
+        sed 's/^/  /'
+
+    echo
+}
+
+###############################################################################
+# RULE LIST
+###############################################################################
+
+firewall_rules() {
+    require_command nft
+
+    if ! nft_exists; then
+        warn "myfw nftables table is not active."
         return 1
     fi
-    
-    case $1 in
-        --add-rule)
-            if [ "$2" == "--port" ]; then
-                local port=$3
-                local protocol=$5
-                
-                if [ -z "$port" ] || [ -z "$protocol" ]; then
-                    log "Missing port or protocol for firewall rule"
-                    return 1
-                fi
-                
-                # Validate port number
-                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-                    log "Invalid port number: $port"
-                    return 1
-                fi
-                
-                # Validate protocol
-                if ! [[ "$protocol" =~ ^(tcp|udp)$ ]]; then
-                    log "Invalid protocol: $protocol (must be tcp or udp)"
-                    return 1
-                fi
-                
-                ufw allow $port/$protocol
-                log "Added firewall rule for $protocol port $port"
-                
-            elif [ "$2" == "--service" ]; then
-                local service=$3
-                
-                if [ -z "$service" ]; then
-                    log "Missing service name for firewall rule"
-                    return 1
-                fi
-                
-                # Check if service exists in /etc/services
-                if ! grep -q "^$service" /etc/services; then
-                    log "Service not found in /etc/services: $service"
-                    return 1
-                fi
-                
-                ufw allow $service
-                log "Added firewall rule for service $service"
-            else
-                log "Invalid add-rule option"
-                return 1
-            fi
-            ;;
-        --panic-mode)
-            if [ "$2" == "--on" ]; then
-                ufw enable
-                ufw default deny incoming
-                ufw default deny outgoing
-                log "Firewall panic mode activated - all traffic blocked"
-            elif [ "$2" == "--off" ]; then
-                ufw default allow outgoing
-                ufw default deny incoming
-                log "Firewall panic mode deactivated"
-            else
-                log "Invalid panic-mode option"
-                return 1
-            fi
-            ;;
-        *)
-            log "Invalid firewall action"
-            return 1
-            ;;
-    esac
+
+    nft list table "$NFT_FAMILY" "$NFT_TABLE"
 }
 
-# =============================================
-# Service Management
-# =============================================
+###############################################################################
+# PORT RULES
+###############################################################################
 
-manage_service() {
-    local service=$1
-    local action=$2
-    
-    if [ -z "$service" ] || [ -z "$action" ]; then
-        log "Service name and action required"
+add_port_rule() {
+
+    local action="$1"
+    local port="$2"
+    local proto="$3"
+    local direction="${4:-input}"
+
+    [ -n "$port" ] || die "Port is required."
+    [ -n "$proto" ] || die "Protocol is required."
+
+    valid_port "$port" ||
+        die "Invalid port: $port"
+
+    valid_protocol "$proto" ||
+        die "Invalid protocol: $proto"
+
+    case "$direction" in
+        input|forward|output)
+            ;;
+        *)
+            die "Invalid direction: $direction"
+            ;;
+    esac
+
+    if [ "$action" = "allow" ]; then
+
+        nft add rule "$NFT_FAMILY" "$NFT_TABLE" "$direction" \
+            "$proto" dport "$port" ct state new accept
+
+        audit "RULE_ADD ACTION=ALLOW DIRECTION=${direction} PROTO=${proto} PORT=${port}"
+
+        log "Allowed ${proto}/${port} on ${direction}."
+
+    elif [ "$action" = "deny" ]; then
+
+        nft add rule "$NFT_FAMILY" "$NFT_TABLE" "$direction" \
+            "$proto" dport "$port" drop
+
+        audit "RULE_ADD ACTION=DENY DIRECTION=${direction} PROTO=${proto} PORT=${port}"
+
+        log "Denied ${proto}/${port} on ${direction}."
+
+    else
+        die "Action must be allow or deny."
+    fi
+}
+
+###############################################################################
+# SERVICE RULES
+###############################################################################
+
+add_service_rule() {
+
+    local action="$1"
+    local service="$2"
+    local direction="${3:-input}"
+
+    [ -n "$service" ] || die "Service name is required."
+
+    local port
+    local proto
+
+    port="$(getent services "$service" 2>/dev/null |
+        awk 'NR==1 {print $2}' |
+        cut -d/ -f1)"
+
+    proto="$(getent services "$service" 2>/dev/null |
+        awk 'NR==1 {print $2}' |
+        cut -d/ -f2)"
+
+    [ -n "$port" ] || die "Service not found: $service"
+    [ -n "$proto" ] || die "Could not determine protocol."
+
+    add_port_rule "$action" "$port" "$proto" "$direction"
+}
+
+###############################################################################
+# BLACKLIST
+###############################################################################
+
+ensure_blacklist_set() {
+
+    if ! nft_exists; then
+        apply_ruleset
+    fi
+
+    if ! nft list set "$NFT_FAMILY" "$NFT_TABLE" "$BLACKLIST_SET" >/dev/null 2>&1; then
+        die "Blacklist set does not exist."
+    fi
+}
+
+block_ip() {
+
+    local ip="$1"
+    local timeout="${2:-}"
+
+    [ -n "$ip" ] || die "IP address required."
+
+    valid_ipv4_or_cidr "$ip" ||
+        die "Invalid IPv4 address/network: $ip"
+
+    ensure_blacklist_set
+
+    if [ -n "$timeout" ]; then
+
+        nft add element "$NFT_FAMILY" "$NFT_TABLE" "$BLACKLIST_SET" \
+            "{ ${ip} timeout ${timeout} }"
+
+        audit "BLOCK_ADD IP=${ip} TIMEOUT=${timeout}"
+        log "Blocked ${ip} for ${timeout}."
+
+    else
+
+        nft add element "$NFT_FAMILY" "$NFT_TABLE" "$BLACKLIST_SET" \
+            "{ ${ip} }"
+
+        audit "BLOCK_ADD IP=${ip} TIMEOUT=PERMANENT"
+        log "Permanently blocked ${ip}."
+
+    fi
+}
+
+unblock_ip() {
+
+    local ip="$1"
+
+    [ -n "$ip" ] || die "IP address required."
+
+    valid_ipv4_or_cidr "$ip" ||
+        die "Invalid IPv4 address/network: $ip"
+
+    ensure_blacklist_set
+
+    nft delete element "$NFT_FAMILY" "$NFT_TABLE" "$BLACKLIST_SET" \
+        "{ ${ip} }" 2>/dev/null || true
+
+    audit "BLOCK_REMOVE IP=${ip}"
+    log "Removed ${ip} from blacklist."
+}
+
+list_blocked() {
+
+    ensure_blacklist_set
+
+    echo
+    echo "Blacklist:"
+    echo "------------------------------------------------------------"
+
+    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$BLACKLIST_SET"
+}
+
+###############################################################################
+# WHITELIST
+###############################################################################
+
+whitelist_ip() {
+
+    local ip="$1"
+
+    [ -n "$ip" ] || die "IP address required."
+
+    valid_ipv4_or_cidr "$ip" ||
+        die "Invalid IPv4 address/network: $ip"
+
+    if ! nft_exists; then
+        apply_ruleset
+    fi
+
+    nft add element "$NFT_FAMILY" "$NFT_TABLE" "$WHITELIST_SET" \
+        "{ ${ip} }"
+
+    audit "WHITELIST_ADD IP=${ip}"
+    log "Whitelisted ${ip}."
+}
+
+###############################################################################
+# NAT
+###############################################################################
+
+configure_nat() {
+
+    local source="$1"
+    local interface="$2"
+
+    [ -n "$source" ] || die "Source network required."
+    [ -n "$interface" ] || die "Output interface required."
+
+    valid_ipv4_or_cidr "$source" ||
+        die "Invalid source network: $source"
+
+    ip link show "$interface" >/dev/null 2>&1 ||
+        die "Interface does not exist: $interface"
+
+    nft add table ip myfw_nat 2>/dev/null || true
+
+    nft 'add chain ip myfw_nat postrouting {
+        type nat hook postrouting priority 100;
+    }' 2>/dev/null || true
+
+    nft add rule ip myfw_nat postrouting \
+        ip saddr "$source" oifname "$interface" masquerade
+
+    audit "NAT_MASQUERADE SOURCE=${source} INTERFACE=${interface}"
+
+    log "Configured masquerade: ${source} -> ${interface}"
+}
+
+###############################################################################
+# DNAT
+###############################################################################
+
+configure_dnat() {
+
+    local external_port="$1"
+    local internal_ip="$2"
+    local internal_port="$3"
+    local proto="${4:-tcp}"
+
+    valid_port "$external_port" ||
+        die "Invalid external port."
+
+    valid_port "$internal_port" ||
+        die "Invalid internal port."
+
+    valid_ipv4 "$internal_ip" ||
+        die "Invalid internal IPv4 address."
+
+    valid_protocol "$proto" ||
+        die "Invalid protocol."
+
+    nft add table ip myfw_nat 2>/dev/null || true
+
+    nft 'add chain ip myfw_nat prerouting {
+        type nat hook prerouting priority -100;
+    }' 2>/dev/null || true
+
+    nft add rule ip myfw_nat prerouting \
+        "$proto" dport "$external_port" \
+        dnat to "${internal_ip}:${internal_port}"
+
+    audit "DNAT EXTERNAL=${external_port} INTERNAL=${internal_ip}:${internal_port} PROTO=${proto}"
+
+    log "Configured DNAT ${proto}/${external_port} -> ${internal_ip}:${internal_port}"
+}
+
+###############################################################################
+# RATE LIMIT
+###############################################################################
+
+add_rate_limit() {
+
+    local port="$1"
+    local proto="$2"
+    local rate="$3"
+
+    valid_port "$port" ||
+        die "Invalid port."
+
+    valid_protocol "$proto" ||
+        die "Invalid protocol."
+
+    [ -n "$rate" ] || die "Rate is required."
+
+    nft add rule "$NFT_FAMILY" "$NFT_TABLE" input \
+        "$proto" dport "$port" \
+        limit rate "$rate" accept
+
+    audit "RATE_LIMIT PORT=${port} PROTO=${proto} RATE=${rate}"
+
+    log "Rate limit added to ${proto}/${port}: ${rate}"
+}
+
+###############################################################################
+# SURICATA
+###############################################################################
+
+suricata_status() {
+
+    if ! command_exists suricata; then
+        echo "Suricata       : NOT INSTALLED"
         return 1
     fi
-    
-    case $action in
-        --start|--stop|--restart|--status)
-            local cmd=$(echo "$action" | sed 's/^--//')
-            systemctl $cmd $service
-            log "Service $service $cmd attempted"
-            ;;
-        *)
-            log "Invalid service action: $action"
-            return 1
-            ;;
-    esac
+
+    if pgrep -x suricata >/dev/null 2>&1; then
+        echo "Suricata       : RUNNING"
+        pgrep -a suricata
+    else
+        echo "Suricata       : STOPPED"
+    fi
 }
 
-# =============================================
-# Main Help Function
-# =============================================
+suricata_start() {
+
+    require_command suricata
+
+    local interface="${1:-}"
+
+    if [ -z "$interface" ]; then
+        interface="$(get_default_interface)"
+    fi
+
+    [ -n "$interface" ] ||
+        die "Could not determine network interface."
+
+    [ -f "$SURICATA_CONFIG" ] ||
+        die "Suricata configuration not found: $SURICATA_CONFIG"
+
+    if pgrep -x suricata >/dev/null 2>&1; then
+        warn "Suricata is already running."
+        return 0
+    fi
+
+    mkdir -p "$SURICATA_LOG_DIR"
+
+    suricata \
+        -c "$SURICATA_CONFIG" \
+        -i "$interface" \
+        -D
+
+    sleep 2
+
+    if pgrep -x suricata >/dev/null 2>&1; then
+        audit "SURICATA_START INTERFACE=${interface} RESULT=SUCCESS"
+        log "Suricata started on ${interface}."
+    else
+        audit "SURICATA_START INTERFACE=${interface} RESULT=FAILED"
+        die "Suricata failed to start."
+    fi
+}
+
+suricata_stop() {
+
+    if ! pgrep -x suricata >/dev/null 2>&1; then
+        warn "Suricata is not running."
+        return 0
+    fi
+
+    pkill -TERM -x suricata
+
+    audit "SURICATA_STOP"
+    log "Suricata stopped."
+}
+
+suricata_update() {
+
+    require_command suricata-update
+
+    suricata-update
+
+    if pgrep -x suricata >/dev/null 2>&1; then
+        pkill -USR2 -x suricata 2>/dev/null || true
+    fi
+
+    audit "SURICATA_RULE_UPDATE"
+    log "Suricata rules updated."
+}
+
+suricata_ips_enable() {
+
+    if ! nft_exists; then
+        apply_ruleset
+    fi
+
+    local queue="${SURICATA_QUEUE:-0}"
+
+    nft add rule "$NFT_FAMILY" "$NFT_TABLE" forward \
+        queue num "$queue" bypass
+
+    audit "SURICATA_IPS_ENABLE QUEUE=${queue}"
+
+    log "Suricata IPS/NFQUEUE enabled on forward traffic."
+}
+
+suricata_log() {
+
+    local file="${SURICATA_LOG_DIR}/fast.log"
+
+    [ -f "$file" ] ||
+        die "Suricata log does not exist: $file"
+
+    tail -f "$file"
+}
+
+###############################################################################
+# FAIL2BAN
+###############################################################################
+
+fail2ban_status() {
+
+    require_command fail2ban-client
+
+    fail2ban-client status
+}
+
+fail2ban_start() {
+
+    require_command fail2ban-server
+
+    if command_exists systemctl; then
+        systemctl start fail2ban
+    elif command_exists service; then
+        service fail2ban start
+    else
+        fail2ban-server -b
+    fi
+
+    audit "FAIL2BAN_START"
+    log "Fail2Ban started."
+}
+
+fail2ban_stop() {
+
+    if command_exists systemctl; then
+        systemctl stop fail2ban 2>/dev/null || true
+    elif command_exists service; then
+        service fail2ban stop 2>/dev/null || true
+    fi
+
+    audit "FAIL2BAN_STOP"
+    log "Fail2Ban stopped."
+}
+
+fail2ban_ban_list() {
+
+    require_command fail2ban-client
+
+    fail2ban-client status
+
+    echo
+
+    fail2ban-client status |
+        awk -F: '/Jail list/ {
+            gsub(/,/, " ", $2);
+            print $2
+        }' |
+        while read -r jail; do
+            [ -n "$jail" ] || continue
+
+            echo
+            echo "Jail: $jail"
+            fail2ban-client status "$jail"
+        done
+}
+
+fail2ban_unban() {
+
+    local ip="$1"
+
+    [ -n "$ip" ] || die "IP address required."
+
+    fail2ban-client status |
+        awk -F: '/Jail list/ {
+            gsub(/,/, " ", $2);
+            print $2
+        }' |
+        while read -r jail; do
+            [ -n "$jail" ] || continue
+            fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null || true
+        done
+
+    # Keep nftables synchronized.
+    unblock_ip "$ip"
+
+    audit "FAIL2BAN_UNBAN IP=${ip}"
+    log "Unbanned ${ip}."
+}
+
+###############################################################################
+# MALTRAIL
+###############################################################################
+
+maltrail_start() {
+
+    if ! command_exists maltrail-server; then
+        die "Maltrail server is not installed."
+    fi
+
+    mkdir -p "$MALTRAIL_DIR"
+
+    if pgrep -f '[m]altrail-server' >/dev/null; then
+        warn "Maltrail server is already running."
+    else
+        nohup maltrail-server \
+            > "${MALTRAIL_DIR}/server.log" 2>&1 &
+
+        log "Maltrail server started."
+    fi
+
+    if command_exists maltrail-sensor; then
+
+        if ! pgrep -f '[m]altrail-sensor' >/dev/null; then
+            nohup maltrail-sensor \
+                > "${MALTRAIL_DIR}/sensor.log" 2>&1 &
+
+            log "Maltrail sensor started."
+        fi
+    fi
+
+    audit "MALTRAIL_START"
+}
+
+maltrail_stop() {
+
+    pkill -f '[m]altrail-server' 2>/dev/null || true
+    pkill -f '[m]altrail-sensor' 2>/dev/null || true
+
+    audit "MALTRAIL_STOP"
+    log "Maltrail stopped."
+}
+
+maltrail_status() {
+
+    if pgrep -f '[m]altrail-server' >/dev/null; then
+        echo "Maltrail server : RUNNING"
+    else
+        echo "Maltrail server : STOPPED"
+    fi
+
+    if pgrep -f '[m]altrail-sensor' >/dev/null; then
+        echo "Maltrail sensor : RUNNING"
+    else
+        echo "Maltrail sensor : STOPPED"
+    fi
+}
+
+###############################################################################
+# PANIC MODE
+###############################################################################
+
+panic_enable() {
+
+    require_command nft
+
+    if ! nft_exists; then
+        apply_ruleset
+    fi
+
+    backup_current_ruleset
+
+    local management="${MANAGEMENT_NETWORK:-}"
+
+    info "Activating firewall panic mode."
+
+    nft add chain "$NFT_FAMILY" "$NFT_TABLE" panic 2>/dev/null || true
+
+    nft flush chain "$NFT_FAMILY" "$NFT_TABLE" panic
+
+    nft add rule "$NFT_FAMILY" "$NFT_TABLE" panic \
+        ct state established,related accept
+
+    nft add rule "$NFT_FAMILY" "$NFT_TABLE" panic \
+        iifname "lo" accept
+
+    if [ -n "$management" ] &&
+       valid_ipv4_or_cidr "$management"; then
+
+        nft add rule "$NFT_FAMILY" "$NFT_TABLE" panic \
+            ip saddr "$management" tcp dport "$SSH_PORT" accept
+    fi
+
+    nft add rule "$NFT_FAMILY" "$NFT_TABLE" panic drop
+
+    # Insert panic chain at beginning of input/forward/output.
+    nft insert rule "$NFT_FAMILY" "$NFT_TABLE" input jump panic
+    nft insert rule "$NFT_FAMILY" "$NFT_TABLE" forward jump panic
+    nft insert rule "$NFT_FAMILY" "$NFT_TABLE" output jump panic
+
+    audit "PANIC_ENABLE"
+    log "PANIC MODE ENABLED."
+}
+
+panic_disable() {
+
+    if ! nft_exists; then
+        warn "myfw firewall is not active."
+        return 0
+    fi
+
+    nft flush chain "$NFT_FAMILY" "$NFT_TABLE" panic 2>/dev/null || true
+
+    # Remove jump rules.
+    while nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" input 2>/dev/null |
+        grep -q 'jump panic'; do
+
+        local handle
+        handle="$(nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" input |
+            awk '/jump panic/ {print $NF; exit}')"
+
+        [ -n "$handle" ] || break
+
+        nft delete rule "$NFT_FAMILY" "$NFT_TABLE" input handle "$handle"
+    done
+
+    while nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" forward 2>/dev/null |
+        grep -q 'jump panic'; do
+
+        local handle
+        handle="$(nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" forward |
+            awk '/jump panic/ {print $NF; exit}')"
+
+        [ -n "$handle" ] || break
+
+        nft delete rule "$NFT_FAMILY" "$NFT_TABLE" forward handle "$handle"
+    done
+
+    while nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" output 2>/dev/null |
+        grep -q 'jump panic'; do
+
+        local handle
+        handle="$(nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" output |
+            awk '/jump panic/ {print $NF; exit}')"
+
+        [ -n "$handle" ] || break
+
+        nft delete rule "$NFT_FAMILY" "$NFT_TABLE" output handle "$handle"
+    done
+
+    nft delete chain "$NFT_FAMILY" "$NFT_TABLE" panic 2>/dev/null || true
+
+    audit "PANIC_DISABLE"
+    log "PANIC MODE DISABLED."
+}
+
+###############################################################################
+# CONNECTION TRACKING
+###############################################################################
+
+conntrack_list() {
+
+    if command_exists conntrack; then
+        conntrack -L
+    else
+        require_command ss
+        ss -tunap
+    fi
+}
+
+conntrack_count() {
+
+    if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+        echo "Active connections:"
+        cat /proc/sys/net/netfilter/nf_conntrack_count
+
+        echo
+        echo "Maximum:"
+        cat /proc/sys/net/netfilter/nf_conntrack_max
+    else
+        warn "conntrack counters are unavailable."
+    fi
+}
+
+conntrack_flush() {
+
+    require_command conntrack
+
+    conntrack -F
+
+    audit "CONNTRACK_FLUSH"
+    log "Connection tracking table flushed."
+}
+
+###############################################################################
+# SERVICE MANAGEMENT
+###############################################################################
+
+service_action() {
+
+    local service="$1"
+    local action="$2"
+
+    [ -n "$service" ] || die "Service name required."
+    [ -n "$action" ] || die "Service action required."
+
+    if command_exists systemctl &&
+       [ -d /run/systemd/system ]; then
+
+        systemctl "$action" "$service"
+
+    elif command_exists sv &&
+         [ -d "/etc/service/${service}" ]; then
+
+        case "$action" in
+            start)
+                sv start "$service"
+                ;;
+            stop)
+                sv stop "$service"
+                ;;
+            restart)
+                sv restart "$service"
+                ;;
+            status)
+                sv status "$service"
+                ;;
+            *)
+                die "Unsupported service action."
+                ;;
+        esac
+
+    elif command_exists service; then
+
+        service "$service" "$action"
+
+    else
+        die "No supported service manager found."
+    fi
+
+    audit "SERVICE SERVICE=${service} ACTION=${action}"
+}
+
+###############################################################################
+# FIREWALL START / STOP
+###############################################################################
+
+firewall_start() {
+
+    apply_ruleset
+
+    audit "FIREWALL_START"
+    log "myfw firewall started."
+}
+
+firewall_stop() {
+
+    require_command nft
+
+    if nft_exists; then
+        backup_current_ruleset
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE"
+    fi
+
+    audit "FIREWALL_STOP"
+    log "myfw firewall stopped."
+}
+
+###############################################################################
+# BACKUP
+###############################################################################
+
+backup_create() {
+
+    require_command nft
+
+    local timestamp
+    timestamp="$(date '+%Y%m%d-%H%M%S')"
+
+    local file="${BACKUP_DIR}/myfw-${timestamp}.nft"
+
+    nft list ruleset > "$file"
+
+    audit "BACKUP_CREATE FILE=${file}"
+
+    echo "Backup created:"
+    echo "$file"
+}
+
+backup_list() {
+
+    ls -lh "$BACKUP_DIR"/*.nft 2>/dev/null ||
+        echo "No firewall backups found."
+}
+
+backup_restore() {
+
+    local file="$1"
+
+    [ -n "$file" ] || die "Backup file required."
+    [ -f "$file" ] || die "Backup not found: $file"
+
+    nft -c -f "$file" ||
+        die "Backup failed validation."
+
+    backup_current_ruleset
+
+    nft -f "$file"
+
+    audit "BACKUP_RESTORE FILE=${file}"
+
+    log "Firewall backup restored."
+}
+
+###############################################################################
+# POLICY VALIDATION
+###############################################################################
+
+policy_validate() {
+
+    generate_base_ruleset
+
+    validate_ruleset
+}
+
+###############################################################################
+# INFORMATION
+###############################################################################
+
+system_info() {
+
+    echo
+    echo "============================================================"
+    echo " KYGnus myfw"
+    echo " Enterprise Linux Firewall & Security Framework"
+    echo " Version: ${VERSION}"
+    echo "============================================================"
+    echo
+
+    echo "System:"
+    echo "  Hostname      : $(hostname)"
+    echo "  Kernel        : $(uname -r)"
+    echo "  Architecture  : $(uname -m)"
+
+    echo
+    echo "Networking:"
+    echo "  Interface     : $(get_default_interface)"
+    echo "  Gateway       : $(get_default_gateway)"
+
+    echo
+    echo "Firewall:"
+    echo "  Engine        : nftables"
+    echo "  Table         : ${NFT_FAMILY} ${NFT_TABLE}"
+
+    if nft_exists; then
+        echo "  Status        : ACTIVE"
+    else
+        echo "  Status        : INACTIVE"
+    fi
+
+    echo
+    echo "Security Engines:"
+
+    if command_exists suricata; then
+        echo "  Suricata      : installed"
+    else
+        echo "  Suricata      : not installed"
+    fi
+
+    if command_exists fail2ban-client; then
+        echo "  Fail2Ban      : installed"
+    else
+        echo "  Fail2Ban      : not installed"
+    fi
+
+    if command_exists conntrack; then
+        echo "  Conntrack     : installed"
+    else
+        echo "  Conntrack     : not installed"
+    fi
+
+    echo
+}
+
+###############################################################################
+# HELP
+###############################################################################
 
 show_help() {
-    cat << EOF
-myfw v$VERSION - Next-Generation Firewall for Linux
 
-Usage: ./myfw [CATEGORY] [ACTION] [OPTIONS]
+    cat <<EOF
 
-Firewall:
-  --firewall rule --add-port PORT --proto PROTO  Add port-based rule
-  --firewall rule --add-service SERVICE          Add service-based rule
-  --firewall panic --enable/--disable            Enable/disable panic mode
+KYGnus myfw ${VERSION}
+Enterprise Linux Firewall & Security Framework
 
-Intrusion Detection/Prevention:
-  --ids suricata --start                        Start Suricata IDS
-  --ids suricata --active-log                   Show Suricata active log
-  --ids suricata --update                       Update Suricata rules
-  --ids suricata --ips-mode                     Configure Suricata in IPS mode
-  --ids suricata --add-rule "RULE"              Add custom rule to Suricata
-  --ids maltrail --start/--stop/--status        Manage Maltrail
-  --ids maltrail --logs --server/--sensor       View Maltrail logs
-  --ids maltrail --update                       Update Maltrail
-  --ips fail2ban --start/--stop/--status        Manage Fail2Ban
-  --ips fail2ban --ban-list                     Show banned IPs
-  --ips fail2ban --unban IP                     Unban an IP
-  --ips fail2ban --add-jail NAME SERVICE [PORT] Add new Fail2Ban jail
+USAGE
 
-Monitoring:
-  --monitor netdata --install                   Install Netdata
-  --monitor netdata --start/--stop/--status     Manage Netdata
-  --monitor netdata --enable-cloud TOKEN ROOMS  Enable Netdata Cloud
+    myfw <command> <subcommand> [options]
 
-Service Management:
-  --service NAME --start/--stop/--restart/--status  Manage system services
+FIREWALL
 
-Examples:
-  ./myfw --firewall rule --add-port 22 --proto tcp
-  ./myfw --firewall panic --enable
-  ./myfw --ids suricata --start
-  ./myfw --ids suricata --add-rule 'alert tcp any any -> any any (msg:"Test Rule"; sid:1000001;)'
-  ./myfw --ids maltrail --start
-  ./myfw --ips fail2ban --add-jail ssh sshd
-  ./myfw --ips fail2ban --ban-list
-  ./myfw --monitor netdata --install
-  ./myfw --service suricata --restart
+    myfw start
+    myfw stop
+    myfw restart
+    myfw status
+    myfw rules
+
+POLICY
+
+    myfw policy validate
+    myfw policy apply
+
+RULES
+
+    myfw rule allow --port 22 --proto tcp
+    myfw rule deny --port 23 --proto tcp
+    myfw rule allow --service ssh
+    myfw rule allow --port 443 --proto tcp --direction input
+
+BLOCKLIST
+
+    myfw block add 203.0.113.10
+    myfw block add 203.0.113.10 --timeout 1h
+    myfw block remove 203.0.113.10
+    myfw block list
+
+WHITELIST
+
+    myfw whitelist add 192.168.1.0/24
+
+NAT
+
+    myfw nat masquerade 192.168.1.0/24 eth0
+
+    myfw nat dnat 443 192.168.10.20 443 tcp
+
+RATE LIMIT
+
+    myfw rate-limit 22 tcp 10/minute
+
+SURICATA
+
+    myfw ids suricata start
+    myfw ids suricata stop
+    myfw ids suricata status
+    myfw ids suricata update
+    myfw ids suricata ips-enable
+    myfw ids suricata logs
+
+FAIL2BAN
+
+    myfw ips fail2ban start
+    myfw ips fail2ban stop
+    myfw ips fail2ban status
+    myfw ips fail2ban bans
+    myfw ips fail2ban unban 203.0.113.10
+
+MALTRAIL
+
+    myfw ids maltrail start
+    myfw ids maltrail stop
+    myfw ids maltrail status
+
+PANIC MODE
+
+    myfw panic enable
+    myfw panic disable
+
+CONNECTION TRACKING
+
+    myfw conntrack list
+    myfw conntrack count
+    myfw conntrack flush
+
+BACKUP
+
+    myfw backup create
+    myfw backup list
+    myfw backup restore FILE
+
+SERVICES
+
+    myfw service ssh restart
+    myfw service fail2ban status
+
+SYSTEM
+
+    myfw info
+    myfw version
+    myfw help
+
+EXAMPLES
+
+    # Allow SSH
+    myfw rule allow --port 22 --proto tcp
+
+    # Allow HTTPS
+    myfw rule allow --port 443 --proto tcp
+
+    # Block malicious IP
+    myfw block add 198.51.100.50
+
+    # Temporary block
+    myfw block add 198.51.100.50 --timeout 1h
+
+    # NAT gateway
+    myfw nat masquerade 192.168.1.0/24 eth0
+
+    # DNAT HTTPS
+    myfw nat dnat 443 192.168.10.20 443 tcp
+
+    # Enable Suricata IPS
+    myfw ids suricata ips-enable
+
+    # Validate firewall
+    myfw policy validate
+
+    # Apply firewall
+    myfw policy apply
+
+    # Emergency lockdown
+    myfw panic enable
+
 EOF
 }
 
-# =============================================
-# Main Execution
-# =============================================
+###############################################################################
+# MAIN
+###############################################################################
 
-acquire_lock
+main() {
 
-case $1 in
-    --help)
-        show_help
-        ;;
-        
-    --firewall)
-        case $2 in
-            rule)
-                manage_firewall --add-rule $3 $4 $5 $6
-                ;;
-            panic)
-                manage_firewall --panic-mode $3
-                ;;
-            *)
-                log "Invalid firewall option"
-                show_help
-                ;;
-        esac
-        ;;
-        
-    --ids)
-        case $2 in
-            suricata)
-                manage_suricata $3 "$4"
-                ;;
-            maltrail)
-                manage_maltrail $3 "$4" "$5"
-                ;;
-            *)
-                log "Invalid IDS category"
-                show_help
-                ;;
-        esac
-        ;;
-        
-    --ips)
-        case $2 in
-            fail2ban)
-                manage_fail2ban $3 "$4" "$5" "$6"
-                ;;
-            *)
-                log "Invalid IPS category"
-                show_help
-                ;;
-        esac
-        ;;
-        
-    --monitor)
-        case $2 in
-            netdata)
-                manage_netdata $3 "$4" "$5"
-                ;;
-            *)
-                log "Invalid monitor category"
-                show_help
-                ;;
-        esac
-        ;;
-        
-    --service)
-        if [ $# -ge 3 ]; then
-            manage_service $2 $3
-        else
-            log "Invalid service command"
+    require_root
+    init_directories
+    load_config
+    acquire_lock
+
+    local command="${1:-help}"
+
+    case "$command" in
+
+        start)
+            firewall_start
+            ;;
+
+        stop)
+            firewall_stop
+            ;;
+
+        restart)
+            firewall_stop
+            firewall_start
+            ;;
+
+        status)
+            firewall_status
+            ;;
+
+        rules)
+            firewall_rules
+            ;;
+
+        policy)
+
+            case "${2:-}" in
+                validate)
+                    policy_validate
+                    ;;
+                apply)
+                    apply_ruleset
+                    ;;
+                *)
+                    show_help
+                    ;;
+            esac
+            ;;
+
+        rule)
+
+            local action="${2:-}"
+            shift 2 || true
+
+            local port=""
+            local proto=""
+            local service=""
+            local direction="input"
+
+            while [ $# -gt 0 ]; do
+
+                case "$1" in
+
+                    --port)
+                        port="$2"
+                        shift 2
+                        ;;
+
+                    --proto|--protocol)
+                        proto="$2"
+                        shift 2
+                        ;;
+
+                    --service)
+                        service="$2"
+                        shift 2
+                        ;;
+
+                    --direction)
+                        direction="$2"
+                        shift 2
+                        ;;
+
+                    *)
+                        die "Unknown rule option: $1"
+                        ;;
+                esac
+
+            done
+
+            if [ -n "$service" ]; then
+                add_service_rule "$action" "$service" "$direction"
+            else
+                add_port_rule "$action" "$port" "$proto" "$direction"
+            fi
+
+            ;;
+
+        block)
+
+            case "${2:-}" in
+
+                add)
+
+                    ip="${3:-}"
+                    timeout=""
+
+                    if [ "${4:-}" = "--timeout" ]; then
+                        timeout="${5:-}"
+                    fi
+
+                    block_ip "$ip" "$timeout"
+                    ;;
+
+                remove)
+                    unblock_ip "${3:-}"
+                    ;;
+
+                list)
+                    list_blocked
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        whitelist)
+
+            case "${2:-}" in
+                add)
+                    whitelist_ip "${3:-}"
+                    ;;
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        nat)
+
+            case "${2:-}" in
+
+                masquerade)
+                    configure_nat "${3:-}" "${4:-}"
+                    ;;
+
+                dnat)
+                    configure_dnat \
+                        "${3:-}" \
+                        "${4:-}" \
+                        "${5:-}" \
+                        "${6:-tcp}"
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        rate-limit)
+
+            add_rate_limit \
+                "${2:-}" \
+                "${3:-}" \
+                "${4:-}"
+
+            ;;
+
+        ids)
+
+            case "${3:-}" in
+
+                start)
+                    suricata_start "${4:-}"
+                    ;;
+
+                stop)
+                    suricata_stop
+                    ;;
+
+                status)
+                    suricata_status
+                    ;;
+
+                update)
+                    suricata_update
+                    ;;
+
+                ips-enable)
+                    suricata_ips_enable
+                    ;;
+
+                logs)
+                    suricata_log
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        ips)
+
+            case "${3:-}" in
+
+                start)
+                    fail2ban_start
+                    ;;
+
+                stop)
+                    fail2ban_stop
+                    ;;
+
+                status)
+                    fail2ban_status
+                    ;;
+
+                bans)
+                    fail2ban_ban_list
+                    ;;
+
+                unban)
+                    fail2ban_unban "${4:-}"
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        panic)
+
+            case "${2:-}" in
+                enable)
+                    panic_enable
+                    ;;
+                disable)
+                    panic_disable
+                    ;;
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        conntrack)
+
+            case "${2:-}" in
+
+                list)
+                    conntrack_list
+                    ;;
+
+                count)
+                    conntrack_count
+                    ;;
+
+                flush)
+                    conntrack_flush
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        backup)
+
+            case "${2:-}" in
+
+                create)
+                    backup_create
+                    ;;
+
+                list)
+                    backup_list
+                    ;;
+
+                restore)
+                    backup_restore "${3:-}"
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        ids-maltrail)
+
+            case "${2:-}" in
+
+                start)
+                    maltrail_start
+                    ;;
+
+                stop)
+                    maltrail_stop
+                    ;;
+
+                status)
+                    maltrail_status
+                    ;;
+
+                *)
+                    show_help
+                    ;;
+            esac
+
+            ;;
+
+        service)
+
+            service_action \
+                "${2:-}" \
+                "${3:-}"
+
+            ;;
+
+        info)
+            system_info
+            ;;
+
+        version)
+            echo "${APP_NAME} ${VERSION}"
+            ;;
+
+        help|--help|-h)
             show_help
-        fi
-        ;;
-        
-    *)
-        log "Invalid option: $1"
-        show_help
-        ;;
-esac
+            ;;
 
-release_lock
-exit 0
+        *)
+            error "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+
+    esac
+}
+
+main "$@"
