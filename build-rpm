@@ -1,0 +1,1058 @@
+#!/usr/bin/env bash
+
+# ==============================================================
+# KYGnus myfw - One-Step RPM Builder
+# ==============================================================
+#
+# Usage:
+#   ./build-rpm
+#
+# Optional:
+#   ./build-rpm --version 3.0.0
+#   ./build-rpm --release 2
+#   ./build-rpm --clean
+#   ./build-rpm --no-build-deps
+#   ./build-rpm --help
+#
+# Output:
+#   dist/myfw-3.0.0-1.noarch.rpm
+#
+# ==============================================================
+
+set -Eeuo pipefail
+
+# ==============================================================
+# Application configuration
+# ==============================================================
+
+APP_NAME="myfw"
+DEFAULT_VERSION="3.0.0"
+DEFAULT_RELEASE="1"
+
+VERSION="${DEFAULT_VERSION}"
+RELEASE="${DEFAULT_RELEASE}"
+
+MAINTAINER="KYGnus <kygnus.co@proton.me>"
+DESCRIPTION="KYGnus Enterprise Linux Firewall and Security Framework"
+URL="https://kygnus.github.io/"
+LICENSE="Proprietary"
+
+# Bash application: architecture independent
+ARCH="noarch"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+SOURCE_SCRIPT="${SCRIPT_DIR}/${APP_NAME}"
+
+BUILD_DIR="${SCRIPT_DIR}/build"
+RPM_TOPDIR="${BUILD_DIR}/rpmbuild"
+
+SOURCES_DIR="${RPM_TOPDIR}/SOURCES"
+SPECS_DIR="${RPM_TOPDIR}/SPECS"
+BUILD_WORK_DIR="${RPM_TOPDIR}/BUILD"
+BUILDROOT_DIR="${RPM_TOPDIR}/BUILDROOT"
+RPMS_DIR="${RPM_TOPDIR}/RPMS"
+SRPMS_DIR="${RPM_TOPDIR}/SRPMS"
+
+DIST_DIR="${SCRIPT_DIR}/dist"
+
+NO_BUILD_DEPS=0
+CLEAN_BUILD=0
+
+# ==============================================================
+# Colors
+# ==============================================================
+
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    BOLD=''
+    NC=''
+fi
+
+# ==============================================================
+# Logging
+# ==============================================================
+
+log() {
+    echo -e "${GREEN}[+]${NC} $*"
+}
+
+info() {
+    echo -e "${BLUE}[i]${NC} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[!]${NC} $*"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+success() {
+    echo -e "${GREEN}[OK]${NC} $*"
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+# ==============================================================
+# Usage
+# ==============================================================
+
+usage() {
+    cat <<EOF
+
+${BOLD}KYGnus ${APP_NAME} RPM Builder${NC}
+
+Usage:
+    ./build-rpm [OPTIONS]
+
+Options:
+
+    --version VERSION
+        Package version.
+        Default: ${DEFAULT_VERSION}
+
+    --release RELEASE
+        RPM release number.
+        Default: ${DEFAULT_RELEASE}
+
+    --clean
+        Remove previous build and distribution files.
+
+    --no-build-deps
+        Do not install missing RPM build dependencies.
+
+    --help
+        Show this help.
+
+Examples:
+
+    ./build-rpm
+
+    ./build-rpm --clean
+
+    ./build-rpm --version 3.0.1
+
+    ./build-rpm --version 3.0.0 --release 2
+
+EOF
+}
+
+# ==============================================================
+# Validation
+# ==============================================================
+
+validate_version() {
+    [[ "${VERSION}" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
+        || die "Invalid version: ${VERSION}"
+}
+
+validate_release() {
+    [[ "${RELEASE}" =~ ^[0-9]+$ ]] \
+        || die "Invalid release: ${RELEASE}"
+}
+
+# ==============================================================
+# Arguments
+# ==============================================================
+
+while [[ $# -gt 0 ]]; do
+
+    case "$1" in
+
+        --version)
+            [[ $# -ge 2 ]] || die "--version requires a value"
+            VERSION="$2"
+            shift 2
+            ;;
+
+        --version=*)
+            VERSION="${1#*=}"
+            shift
+            ;;
+
+        --release)
+            [[ $# -ge 2 ]] || die "--release requires a value"
+            RELEASE="$2"
+            shift 2
+            ;;
+
+        --release=*)
+            RELEASE="${1#*=}"
+            shift
+            ;;
+
+        --clean)
+            CLEAN_BUILD=1
+            shift
+            ;;
+
+        --no-build-deps)
+            NO_BUILD_DEPS=1
+            shift
+            ;;
+
+        --help|-h)
+            usage
+            exit 0
+            ;;
+
+        *)
+            die "Unknown option: $1"
+            ;;
+
+    esac
+
+done
+
+validate_version
+validate_release
+
+# ==============================================================
+# Header
+# ==============================================================
+
+echo
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}              KYGnus myfw RPM Builder${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo
+echo "Application : ${APP_NAME}"
+echo "Version     : ${VERSION}"
+echo "Release     : ${RELEASE}"
+echo "Architecture: ${ARCH}"
+echo "Source      : ${SOURCE_SCRIPT}"
+echo
+
+# ==============================================================
+# Safety
+# ==============================================================
+
+if [[ "${EUID}" -eq 0 ]]; then
+    die "Do not run this script as root."
+fi
+
+# ==============================================================
+# Source validation
+# ==============================================================
+
+[[ -f "${SOURCE_SCRIPT}" ]] \
+    || die "Source file not found: ${SOURCE_SCRIPT}"
+
+log "Checking Bash syntax..."
+
+bash -n "${SOURCE_SCRIPT}" \
+    || die "Bash syntax check failed."
+
+success "Bash syntax OK."
+
+# ==============================================================
+# Package manager
+# ==============================================================
+
+PACKAGE_MANAGER=""
+
+if command -v zypper >/dev/null 2>&1; then
+    PACKAGE_MANAGER="zypper"
+elif command -v dnf >/dev/null 2>&1; then
+    PACKAGE_MANAGER="dnf"
+elif command -v yum >/dev/null 2>&1; then
+    PACKAGE_MANAGER="yum"
+fi
+
+# ==============================================================
+# RPM build dependencies
+# ==============================================================
+
+if ! command -v rpm >/dev/null 2>&1; then
+
+    if [[ "${NO_BUILD_DEPS}" -eq 1 ]]; then
+        die "rpm is not installed."
+    fi
+
+    case "${PACKAGE_MANAGER}" in
+
+        zypper)
+            log "Installing rpm..."
+            sudo zypper --non-interactive install rpm
+            ;;
+
+        dnf)
+            log "Installing rpm..."
+            sudo dnf install -y rpm
+            ;;
+
+        yum)
+            log "Installing rpm..."
+            sudo yum install -y rpm
+            ;;
+
+        *)
+            die "Could not determine package manager."
+            ;;
+
+    esac
+
+fi
+
+if ! command -v rpmbuild >/dev/null 2>&1; then
+
+    if [[ "${NO_BUILD_DEPS}" -eq 1 ]]; then
+        die "rpmbuild is not installed."
+    fi
+
+    case "${PACKAGE_MANAGER}" in
+
+        zypper)
+            log "Installing rpm-build..."
+            sudo zypper --non-interactive install rpm-build
+            ;;
+
+        dnf)
+            log "Installing rpm-build..."
+            sudo dnf install -y rpm-build
+            ;;
+
+        yum)
+            log "Installing rpm-build..."
+            sudo yum install -y rpm-build
+            ;;
+
+        *)
+            die "Could not determine package manager."
+            ;;
+
+    esac
+
+fi
+
+command -v rpm >/dev/null 2>&1 \
+    || die "rpm command not found."
+
+command -v rpmbuild >/dev/null 2>&1 \
+    || die "rpmbuild command not found."
+
+success "RPM build tools available."
+
+# ==============================================================
+# Clean build
+# ==============================================================
+
+if [[ "${CLEAN_BUILD}" -eq 1 ]]; then
+
+    log "Removing previous build..."
+
+    rm -rf "${BUILD_DIR}"
+    rm -rf "${DIST_DIR}"
+
+fi
+
+# ==============================================================
+# Always remove stale RPM build data
+# ==============================================================
+
+log "Cleaning stale RPM artifacts..."
+
+rm -rf "${RPM_TOPDIR}"
+
+mkdir -p \
+    "${SOURCES_DIR}" \
+    "${SPECS_DIR}" \
+    "${BUILD_WORK_DIR}" \
+    "${BUILDROOT_DIR}" \
+    "${RPMS_DIR}" \
+    "${SRPMS_DIR}" \
+    "${DIST_DIR}"
+
+# ==============================================================
+# Create source tree
+# ==============================================================
+
+SOURCE_NAME="${APP_NAME}-${VERSION}"
+SOURCE_TREE="${BUILD_DIR}/${SOURCE_NAME}"
+
+log "Creating source tree..."
+
+rm -rf "${SOURCE_TREE}"
+
+mkdir -p \
+    "${SOURCE_TREE}" \
+    "${SOURCE_TREE}/etc/${APP_NAME}/rules" \
+    "${SOURCE_TREE}/etc/${APP_NAME}/sets" \
+    "${SOURCE_TREE}/etc/${APP_NAME}/backups" \
+    "${SOURCE_TREE}/var/lib/${APP_NAME}/state" \
+    "${SOURCE_TREE}/var/lib/${APP_NAME}/feeds" \
+    "${SOURCE_TREE}/var/log/${APP_NAME}" \
+    "${SOURCE_TREE}/run/${APP_NAME}" \
+    "${SOURCE_TREE}/usr/share/doc/${APP_NAME}"
+
+# ==============================================================
+# Install source application
+# ==============================================================
+
+log "Copying ${APP_NAME}..."
+
+install -m 0755 \
+    "${SOURCE_SCRIPT}" \
+    "${SOURCE_TREE}/${APP_NAME}"
+
+# ==============================================================
+# Default configuration
+# ==============================================================
+
+log "Creating default configuration..."
+
+cat > "${SOURCE_TREE}/etc/${APP_NAME}/${APP_NAME}.conf" <<'EOF'
+# ==============================================================
+# KYGnus myfw Configuration
+# ==============================================================
+
+MYFW_ENABLE_IPV6="yes"
+
+INPUT_POLICY="drop"
+FORWARD_POLICY="drop"
+OUTPUT_POLICY="accept"
+
+ENABLE_LOGGING="yes"
+LOG_PREFIX="MYFW"
+
+SSH_PORT="22"
+
+MANAGEMENT_NETWORK=""
+
+WAN_INTERFACE=""
+LAN_INTERFACE=""
+
+SURICATA_QUEUE="0"
+
+PANIC_ROLLBACK="0"
+EOF
+
+chmod 0640 \
+    "${SOURCE_TREE}/etc/${APP_NAME}/${APP_NAME}.conf"
+
+# ==============================================================
+# Documentation
+# ==============================================================
+
+log "Creating documentation..."
+
+cat > "${SOURCE_TREE}/usr/share/doc/${APP_NAME}/README.SUSE" <<EOF
+${APP_NAME}
+==============================================================
+
+${DESCRIPTION}
+
+Version:
+${VERSION}-${RELEASE}
+
+Website:
+${URL}
+
+
+Installation
+--------------------------------------------------------------
+
+sudo zypper install ${APP_NAME}-${VERSION}-${RELEASE}.noarch.rpm
+
+
+Executable
+--------------------------------------------------------------
+
+/usr/bin/${APP_NAME}
+
+
+Configuration
+--------------------------------------------------------------
+
+/etc/${APP_NAME}/${APP_NAME}.conf
+
+/etc/${APP_NAME}/rules/
+/etc/${APP_NAME}/sets/
+/etc/${APP_NAME}/backups/
+
+
+State
+--------------------------------------------------------------
+
+/var/lib/${APP_NAME}/
+/var/lib/${APP_NAME}/state/
+/var/lib/${APP_NAME}/feeds/
+
+
+Logs
+--------------------------------------------------------------
+
+/var/log/${APP_NAME}/
+
+
+Runtime
+--------------------------------------------------------------
+
+/run/${APP_NAME}/
+
+
+Usage
+--------------------------------------------------------------
+
+sudo ${APP_NAME}
+
+sudo ${APP_NAME} info
+
+sudo ${APP_NAME} status
+
+sudo ${APP_NAME} start
+
+sudo ${APP_NAME} stop
+
+sudo ${APP_NAME} reload
+
+
+Important
+--------------------------------------------------------------
+
+The RPM does not automatically enable the firewall.
+
+Review the configuration and firewall rules before activating
+the firewall.
+
+
+Maintainer
+--------------------------------------------------------------
+
+${MAINTAINER}
+EOF
+
+cat > "${SOURCE_TREE}/usr/share/doc/${APP_NAME}/copyright" <<EOF
+${APP_NAME}
+Copyright (c) KYGnus
+
+Maintainer:
+${MAINTAINER}
+
+License:
+${LICENSE}
+
+Website:
+${URL}
+EOF
+
+# ==============================================================
+# Create source archive
+# ==============================================================
+
+log "Creating source archive..."
+
+SOURCE_TARBALL="${SOURCES_DIR}/${SOURCE_NAME}.tar.gz"
+
+tar \
+    -C "${BUILD_DIR}" \
+    -czf "${SOURCE_TARBALL}" \
+    "${SOURCE_NAME}"
+
+[[ -f "${SOURCE_TARBALL}" ]] \
+    || die "Source archive creation failed."
+
+success "Source archive created."
+
+# ==============================================================
+# Create SPEC
+# ==============================================================
+#
+# IMPORTANT:
+# The SPEC is generated by Bash.
+#
+# RPM macros use:
+#   %{name}
+#   %{version}
+#   %{_bindir}
+#   etc.
+#
+# Bash must NOT expand those.
+#
+# Therefore every RPM macro below is written as:
+#   %%{name}
+#
+# Bash converts %% -> % in the generated SPEC.
+#
+# ==============================================================
+
+SPEC_FILE="${SPECS_DIR}/${APP_NAME}.spec"
+
+log "Creating SPEC file..."
+
+cat > "${SPEC_FILE}" <<EOF
+Name:           ${APP_NAME}
+Version:        ${VERSION}
+Release:        ${RELEASE}%{?dist}
+Summary:        ${DESCRIPTION}
+License:        ${LICENSE}
+URL:            ${URL}
+Source0:        %{name}-%{version}.tar.gz
+BuildArch:      noarch
+
+Requires:       bash
+Requires:       nftables
+Requires:       iproute2
+Requires:       procps
+Requires:       util-linux
+Requires:       conntrack-tools
+Requires:       suricata
+Requires:       suricata-update
+Requires:       fail2ban
+
+Recommends:     maltrail
+Recommends:     netdata
+
+%description
+${DESCRIPTION}
+
+myfw is a Bash-based enterprise Linux firewall and security
+framework built around nftables.
+
+It provides firewall policy management, logging, network
+security integration and support for Suricata and Fail2Ban.
+
+%prep
+%setup -q
+
+%build
+# No compilation required.
+
+%install
+
+rm -rf %{buildroot}
+
+# --------------------------------------------------------------
+# Main executable
+# --------------------------------------------------------------
+
+install -D -m 0755 \
+    %{name} \
+    %{buildroot}%{_bindir}/%{name}
+
+# --------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------
+
+install -D -m 0640 \
+    etc/%{name}/%{name}.conf \
+    %{buildroot}%{_sysconfdir}/%{name}/%{name}.conf
+
+install -d -m 0750 \
+    %{buildroot}%{_sysconfdir}/%{name}/rules \
+    %{buildroot}%{_sysconfdir}/%{name}/sets \
+    %{buildroot}%{_sysconfdir}/%{name}/backups
+
+# --------------------------------------------------------------
+# State
+# --------------------------------------------------------------
+
+install -d -m 0750 \
+    %{buildroot}%{_sharedstatedir}/%{name} \
+    %{buildroot}%{_sharedstatedir}/%{name}/state \
+    %{buildroot}%{_sharedstatedir}/%{name}/feeds
+
+# --------------------------------------------------------------
+# Logs
+# --------------------------------------------------------------
+
+install -d -m 0750 \
+    %{buildroot}%{_localstatedir}/log/%{name}
+
+# --------------------------------------------------------------
+# Runtime
+# --------------------------------------------------------------
+
+install -d -m 0755 \
+    %{buildroot}%{_rundir}/%{name}
+
+# --------------------------------------------------------------
+# Documentation
+# --------------------------------------------------------------
+
+install -D -m 0644 \
+    usr/share/doc/%{name}/README.SUSE \
+    %{buildroot}%{_docdir}/%{name}/README.SUSE
+
+install -D -m 0644 \
+    usr/share/doc/%{name}/copyright \
+    %{buildroot}%{_docdir}/%{name}/copyright
+
+# ==============================================================
+# Installation script
+# ==============================================================
+
+%post
+
+install -d -m 0750 \
+    %{_sysconfdir}/%{name}/rules \
+    %{_sysconfdir}/%{name}/sets \
+    %{_sysconfdir}/%{name}/backups
+
+install -d -m 0750 \
+    %{_sharedstatedir}/%{name} \
+    %{_sharedstatedir}/%{name}/state \
+    %{_sharedstatedir}/%{name}/feeds
+
+install -d -m 0750 \
+    %{_localstatedir}/log/%{name}
+
+install -d -m 0755 \
+    %{_rundir}/%{name}
+
+echo
+echo "=============================================================="
+echo " %{name} installed successfully"
+echo "=============================================================="
+echo
+echo "Executable:"
+echo "  %{_bindir}/%{name}"
+echo
+echo "Configuration:"
+echo "  %{_sysconfdir}/%{name}/%{name}.conf"
+echo
+echo "Firewall was NOT automatically enabled."
+echo
+echo "Test:"
+echo "  sudo %{_bindir}/%{name} info"
+echo
+echo "=============================================================="
+echo
+
+# ==============================================================
+# Pre-uninstall
+# ==============================================================
+
+%preun
+
+if [ "\$1" -eq 0 ]; then
+    echo
+    echo "Removing %{name}..."
+    echo "Existing firewall rules are not automatically modified."
+    echo
+fi
+
+# ==============================================================
+# Post-uninstall
+# ==============================================================
+
+%postun
+
+if [ "\$1" -eq 0 ]; then
+    rm -rf \
+        %{_sharedstatedir}/%{name} \
+        %{_localstatedir}/log/%{name} \
+        %{_rundir}/%{name}
+fi
+
+# ==============================================================
+# Files
+# ==============================================================
+
+%files
+
+%defattr(-,root,root,-)
+
+# Executable
+%{_bindir}/%{name}
+
+# Configuration
+%dir %{_sysconfdir}/%{name}
+%config(noreplace) %{_sysconfdir}/%{name}/%{name}.conf
+
+# Configuration directories
+%dir %{_sysconfdir}/%{name}/rules
+%dir %{_sysconfdir}/%{name}/sets
+%dir %{_sysconfdir}/%{name}/backups
+
+# State directories
+%dir %{_sharedstatedir}/%{name}
+%dir %{_sharedstatedir}/%{name}/state
+%dir %{_sharedstatedir}/%{name}/feeds
+
+# Log directory
+%dir %{_localstatedir}/log/%{name}
+
+# Runtime directory
+%dir %{_rundir}/%{name}
+
+# Documentation
+%doc %{_docdir}/%{name}/README.SUSE
+%doc %{_docdir}/%{name}/copyright
+
+%changelog
+* Thu Sep 24 2026 ${MAINTAINER} - ${VERSION}-${RELEASE}
+- Build RPM package for KYGnus myfw
+EOF
+
+[[ -s "${SPEC_FILE}" ]] \
+    || die "SPEC file was not generated."
+
+# ==============================================================
+# SPEC sanity check
+# ==============================================================
+
+log "Checking SPEC file..."
+
+if grep -q '\${name}' "${SPEC_FILE}"; then
+    die "SPEC contains an unexpanded Bash variable: \${name}"
+fi
+
+if grep -q 'myfw-debugsource' "${SPEC_FILE}"; then
+    die "Invalid debugsource content detected in SPEC."
+fi
+
+success "SPEC file looks valid."
+
+# ==============================================================
+# Build
+# ==============================================================
+
+log "Building RPM..."
+
+rpmbuild \
+    --define "_topdir ${RPM_TOPDIR}" \
+    --define "_sourcedir ${SOURCES_DIR}" \
+    --define "_specdir ${SPECS_DIR}" \
+    --define "_builddir ${BUILD_WORK_DIR}" \
+    --define "_buildrootdir ${BUILDROOT_DIR}" \
+    --define "_rpmdir ${RPMS_DIR}" \
+    --define "_srcrpmdir ${SRPMS_DIR}" \
+    -bb \
+    "${SPEC_FILE}"
+
+success "rpmbuild completed."
+
+# ==============================================================
+# Find real package
+# ==============================================================
+
+log "Searching for ${APP_NAME} RPM..."
+
+BUILT_RPM=""
+
+while IFS= read -r FILE; do
+
+    [[ -f "${FILE}" ]] || continue
+
+    PACKAGE_NAME="$(rpm -qp --qf '%{NAME}' "${FILE}" 2>/dev/null || true)"
+
+    if [[ "${PACKAGE_NAME}" == "${APP_NAME}" ]]; then
+        BUILT_RPM="${FILE}"
+        break
+    fi
+
+done < <(
+    find "${RPMS_DIR}" \
+        -type f \
+        -name '*.rpm' \
+        -print | sort
+)
+
+# ==============================================================
+# No package found
+# ==============================================================
+
+if [[ -z "${BUILT_RPM}" ]]; then
+
+    error "No RPM named '${APP_NAME}' was produced."
+
+    echo
+    echo "Generated RPM files:"
+    echo
+
+    find "${RPM_TOPDIR}" \
+        -type f \
+        -name '*.rpm' \
+        -print
+
+    echo
+    echo "RPM metadata:"
+    echo
+
+    while IFS= read -r FILE; do
+
+        echo "------------------------------------------------------------"
+        echo "${FILE}"
+
+        rpm -qpi "${FILE}" 2>/dev/null | \
+            grep -E \
+                '^(Name|Version|Release|Architecture|Summary|Source RPM)' \
+            || true
+
+    done < <(
+        find "${RPM_TOPDIR}" \
+            -type f \
+            -name '*.rpm' \
+            -print
+    )
+
+    exit 1
+
+fi
+
+success "Correct RPM found:"
+echo "    ${BUILT_RPM}"
+
+# ==============================================================
+# Verify metadata
+# ==============================================================
+
+log "Verifying package metadata..."
+
+PKG_NAME="$(rpm -qp --qf '%{NAME}' "${BUILT_RPM}")"
+PKG_VERSION="$(rpm -qp --qf '%{VERSION}' "${BUILT_RPM}")"
+PKG_RELEASE="$(rpm -qp --qf '%{RELEASE}' "${BUILT_RPM}")"
+PKG_ARCH="$(rpm -qp --qf '%{ARCH}' "${BUILT_RPM}")"
+
+[[ "${PKG_NAME}" == "${APP_NAME}" ]] \
+    || die "Wrong package name: ${PKG_NAME}"
+
+[[ "${PKG_VERSION}" == "${VERSION}" ]] \
+    || die "Wrong package version: ${PKG_VERSION}"
+
+[[ "${PKG_ARCH}" == "noarch" ]] \
+    || die "Wrong package architecture: ${PKG_ARCH}"
+
+case "${PKG_NAME}" in
+
+    *debugsource*|*debuginfo*)
+        die "Debug RPM detected: ${PKG_NAME}"
+        ;;
+
+esac
+
+success "Package metadata is correct."
+
+# ==============================================================
+# Verify package contents
+# ==============================================================
+
+log "Verifying package contents..."
+
+if ! rpm -qpl "${BUILT_RPM}" | grep -qx '/usr/bin/myfw'; then
+
+    echo
+    echo "RPM contents:"
+    rpm -qpl "${BUILT_RPM}"
+    echo
+
+    die "RPM does not contain /usr/bin/myfw."
+
+fi
+
+if ! rpm -qpl "${BUILT_RPM}" | grep -qx '/etc/myfw/myfw.conf'; then
+    die "RPM does not contain /etc/myfw/myfw.conf."
+fi
+
+success "Package contains /usr/bin/myfw."
+
+# ==============================================================
+# Final package
+# ==============================================================
+
+FINAL_RPM="${DIST_DIR}/${APP_NAME}-${VERSION}-${RELEASE}.${ARCH}.rpm"
+
+rm -f "${FINAL_RPM}"
+
+cp "${BUILT_RPM}" "${FINAL_RPM}"
+
+chmod 0644 "${FINAL_RPM}"
+
+# ==============================================================
+# Final verification
+# ==============================================================
+
+log "Performing final verification..."
+
+FINAL_NAME="$(rpm -qp --qf '%{NAME}' "${FINAL_RPM}")"
+FINAL_VERSION="$(rpm -qp --qf '%{VERSION}' "${FINAL_RPM}")"
+FINAL_RELEASE="$(rpm -qp --qf '%{RELEASE}' "${FINAL_RPM}")"
+FINAL_ARCH="$(rpm -qp --qf '%{ARCH}' "${FINAL_RPM}")"
+
+[[ "${FINAL_NAME}" == "${APP_NAME}" ]] \
+    || die "Final package name is incorrect."
+
+[[ "${FINAL_VERSION}" == "${VERSION}" ]] \
+    || die "Final package version is incorrect."
+
+[[ "${FINAL_RELEASE}" == "${RELEASE}" ]] \
+    || die "Final package release is incorrect."
+
+[[ "${FINAL_ARCH}" == "noarch" ]] \
+    || die "Final package architecture is incorrect."
+
+rpm -qpl "${FINAL_RPM}" | \
+    grep -qx '/usr/bin/myfw' \
+    || die "Final RPM does not contain /usr/bin/myfw."
+
+# ==============================================================
+# Complete
+# ==============================================================
+
+echo
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${GREEN}                 BUILD SUCCESSFUL${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo
+
+echo -e "${BOLD}Package:${NC}"
+echo "  ${FINAL_RPM}"
+echo
+
+echo -e "${BOLD}Metadata:${NC}"
+
+rpm -qpi "${FINAL_RPM}" | \
+    grep -E \
+        '^(Name|Version|Release|Architecture|Size|License|URL|Summary|Source RPM|Build Date)'
+
+echo
+echo -e "${BOLD}Main executable:${NC}"
+echo "  /usr/bin/myfw"
+
+echo
+echo -e "${BOLD}${GREEN}Install:${NC}"
+echo
+echo "  sudo zypper install \"${FINAL_RPM}\""
+
+echo
+echo -e "${BOLD}${GREEN}Run:${NC}"
+echo
+echo "  sudo myfw info"
+
+echo
+echo -e "${BOLD}${GREEN}Verify:${NC}"
+echo
+echo "  rpm -q myfw"
+echo "  command -v myfw"
+echo "  rpm -ql myfw"
+
+echo
+echo -e "${BOLD}${GREEN}Remove:${NC}"
+echo
+echo "  sudo zypper remove myfw"
+
+echo
+echo -e "${BOLD}${CYAN}Output:${NC}"
+echo "  ${FINAL_RPM}"
+
+echo
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo
